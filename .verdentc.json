@@ -1,0 +1,7 @@
+{
+  "deploy": {
+    "type": "fullstack",
+    "rootDir": "magicpin-ai-challenge",
+    "appPort": 8080
+  }
+}
