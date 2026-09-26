@@ -1,639 +1,396 @@
-"""Deterministic composition: route policy + contexts -> WhatsApp message.
+"""Deterministic, extractive composition with explicit evidence and action drafts.
 
-Every claim is pulled from the supplied contexts; nothing is invented.
+No model credentials or external side effects are required. Unknown or incomplete
+triggers produce no message. Category examples are never treated as active offers.
 """
-from typing import Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+import math
+import re
 
-from .routing import RoutePolicy, get_policy
+from .routing import consent_allows, get_policy, trigger_ids
+from .timeutils import parse_time
 
-
-# ---------------------------------------------------------------- helpers ---
-
-def _owner(merchant: dict) -> str:
-    identity = merchant.get("identity", {})
-    first = identity.get("owner_first_name")
-    if first:
-        name = merchant.get("identity", {}).get("name", "")
-        if name.strip().startswith("Dr.") and not first.strip().startswith("Dr."):
-            return f"Dr. {first}"
-        return first
-    return identity.get("name", "there")
+VERSION = "grounded-composer-v2"
 
 
-def _merchant_name(merchant: dict) -> str:
-    return merchant.get("identity", {}).get("name", "your business")
+def text(value):
+    return value.strip() if isinstance(value, str) else ""
 
 
-def _customer_name(customer: dict) -> str:
-    return ((customer or {}).get("identity") or {}).get("name", "there")
+def label(value):
+    return text(value).replace("_", " ")
 
 
-def _is_hi(merchant: dict) -> bool:
-    langs = [str(x).lower() for x in merchant.get("identity", {}).get("languages", [])]
-    return "hi" in langs
+def number(value):
+    return type(value) in (int, float) and math.isfinite(value)
 
 
-def _pct(x, signed=True) -> str:
-    try:
-        v = float(x) * 100
-        s = f"{v:+.0f}%" if signed else f"{v:.0f}%"
-    except (TypeError, ValueError):
-        return ""
-    return s
+def _owner(merchant):
+    identity = merchant.get("identity") or {}
+    first = text(identity.get("owner_first_name"))
+    name = first or text(identity.get("name"))
+    if first and merchant.get("category_slug") == "dentists" and not first.startswith("Dr."):
+        return f"Dr. {first}"
+    return name
 
 
-def _active_offers(merchant: dict) -> list:
-    return [o for o in merchant.get("offers", []) if o.get("status") == "active"]
+def _merchant_name(merchant):
+    return text((merchant.get("identity") or {}).get("name"))
 
 
-def _find_digest(category: dict, item_id: Optional[str]) -> Optional[dict]:
-    for item in (category or {}).get("digest", []):
-        if item.get("id") == item_id:
-            return item
-    if (category or {}).get("digest"):
-        return category["digest"][0]
+def language(merchant, customer=None):
+    identity = (customer or merchant).get("identity") or {}
+    if customer:
+        pref = text(identity.get("language_pref")).lower()
+    else:
+        langs = identity.get("languages") or []
+        pref = text(identity.get("language_pref")).lower() or ("hi" if "hi" in langs else "en")
+    for code in ("hi", "ta", "te", "kn", "mr"):
+        if pref.startswith(code):
+            return code
+    return "en"
+
+
+def _is_hi(merchant):
+    return language(merchant) == "hi"
+
+
+def _active_offers(merchant):
+    return [o for o in merchant.get("offers", []) if o.get("status") == "active" and text(o.get("title"))]
+
+
+def _find_digest(category, item_id):
+    # An explicit missing id must not silently resolve to an unrelated paper.
+    return next((x for x in category.get("digest", []) if item_id and x.get("id") == item_id), None)
+
+
+def digest_item(category, trigger):
+    p = trigger.get("payload") or {}
+    item_id = p.get("top_item_id") or p.get("digest_item_id") or p.get("alert_id")
+    if item_id:
+        return _find_digest(category, item_id)
+    if isinstance(p.get("top_item"), dict):
+        return p["top_item"]
+    kind = trigger.get("kind")
+    allowed = {"regulation_change": {"compliance"}, "cde_opportunity": {"cde"},
+               "supply_alert": {"supply"}}.get(kind, {"research", "trend", "tech", "seasonal"})
+    return next((x for x in reversed(category.get("digest", [])) if x.get("kind") in allowed), None)
+
+
+def slot_labels(payload, now=None):
+    slots = payload.get("available_slots", payload.get("next_session_options", []))
+    if not isinstance(slots, list):
+        return []
+    result = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        if slot.get("iso"):
+            try:
+                instant = parse_time(slot["iso"])
+                if now and instant <= now:
+                    continue
+                # Supplied labels sometimes have incorrect weekdays. Use the ISO
+                # value (and its local offset) as the schedule source of truth.
+                local = datetime.fromisoformat(slot["iso"].replace("Z", "+00:00"))
+                rendered = local.strftime("%a %d %b, %H:%M %z")
+            except (ValueError, TypeError):
+                continue
+        else:
+            rendered = text(slot.get("label"))
+        if rendered:
+            result.append(rendered)
+    return result[:2]
+
+
+@dataclass
+class Plan:
+    fact: str
+    ask: str = "Want a draft to review?"
+    next_step: str = ""
+    cta: str = "binary_yes_no"
+    ask_hi: str = "Review ke liye draft banaun?"
+
+
+@dataclass
+class Composed:
+    body: str
+    cta: str
+    send_as: str
+    suppression_key: str
+    rationale: str
+    template_name: str | None
+    template_params: list[str]
+    fact: str = ""
+    next_step: str = ""
+    evidence: list[str] = field(default_factory=list)
+
+    def public(self):
+        return {k: getattr(self, k) for k in ("body", "cta", "send_as", "suppression_key", "rationale")}
+
+
+def merchant_plan(cat, m, trg):
+    p = trg.get("payload") or {}
+    kind = trg.get("kind")
+    name = _merchant_name(m)
+    offers = _active_offers(m)
+    active = f"Active offer: {offers[0]['title']}." if offers else ""
+    if kind in {"research_digest", "research_digest_release", "category_research_digest_release", "regulation_change", "cde_opportunity"}:
+        item = digest_item(cat, trg)
+        if not item or not text(item.get("title")) or not text(item.get("source")):
+            return None
+        fact = f"{item['title']} — {item['source']}."
+        if text(item.get("summary")):
+            fact += " " + item["summary"]
+        if kind == "regulation_change" and text(p.get("deadline_iso")):
+            fact += f" Deadline: {p['deadline_iso']}."
+        if kind == "cde_opportunity":
+            for key in ("date", "credits"):
+                value = p.get(key, item.get(key))
+                if isinstance(value, (str, int, float)):
+                    fact += f" {key.title()}: {value}."
+            if text(p.get("fee")):
+                fact += f" Fee: {label(p['fee'])}."
+            return Plan(fact, "Want the registration checklist?",
+                        f"Registration checklist: check eligibility and fee with the organiser; request a place for {item['title']}. No seat has been reserved.",
+                        ask_hi="Registration checklist bhejun?")
+        next_step = f"Source summary: {item.get('summary') or item['title']} — {item['source']}."
+        if kind == "regulation_change":
+            next_step += "\nChecklist: compare your current process with the cited notice; record any gaps and the required changes."
+        else:
+            noun = "care" if cat.get("slug") in {"dentists", "pharmacies"} else "service"
+            next_step += f'\nCustomer note draft: "For questions about your {noun}, the team at {name} can explain the options relevant to you."'
+        return Plan(fact, "Want a source summary and a draft note for review?", next_step,
+                    ask_hi="Source summary aur review ke liye note ka draft bhejun?")
+    if kind in {"perf_dip", "perf_spike", "seasonal_perf_dip"}:
+        metric = text(p.get("metric"))
+        delta = p.get("delta_pct")
+        if not metric or not number(delta):
+            return None
+        window = label(p.get("window"))
+        fact = f"{name}: {metric} changed {delta * 100:+g}%" + (f" over {window}" if window else "") + "."
+        perf = m.get("performance") or {}
+        if number(perf.get(metric)) and number(perf.get("window_days")):
+            fact += f" Latest {perf['window_days']}-day snapshot: {perf[metric]} {metric}."
+        if kind == "seasonal_perf_dip" and p.get("is_expected_seasonal") is True:
+            fact += f" Flagged as expected seasonality: {label(p.get('season_note'))}."
+            count = (m.get("customer_aggregate") or {}).get("total_active_members")
+            if number(count):
+                fact += f" You have {count} active members."
+            return Plan(fact, "Want an attendance-message draft for your members?",
+                        f'Attendance draft: "{name} members, what would help you keep a regular routine this season? Share your preferred session time."',
+                        ask_hi="Members ke liye attendance message ka draft banaun?")
+        if (m.get("identity") or {}).get("verified") is False:
+            fact += " Your Google profile is unverified."
+        return Plan(fact, "Want a profile checklist?",
+                    f"Profile checklist for {name}: check verification, opening hours and service details against your current operations. " + active,
+                    ask_hi="Profile checklist bhejun?")
+    if kind == "festival_upcoming":
+        festival = text(p.get("festival"))
+        if not festival:
+            return None
+        fact = f"{festival} is coming up" + (f" on {p['date']}" if text(p.get("date")) else "") + ". " + active
+        draft = f'Campaign draft for review: "{name} — {festival}. {active}" Terms and availability need your approval before use.'
+        return Plan(fact, f"Want a {festival} campaign draft?", draft, ask_hi=f"{festival} campaign ka draft banaun?")
+    if kind == "ipl_match_today":
+        match = text(p.get("match"))
+        if not match:
+            return None
+        fact = f"Match update: {match}"
+        if text(p.get("venue")):
+            fact += f" at {p['venue']}"
+        if text(p.get("match_time_iso")):
+            fact += f", {p['match_time_iso']}"
+        fact += "."
+        if offers:
+            fact += f" Your listed offer is {offers[0]['title']}; keep its day restrictions when preparing any match post."
+        return Plan(fact, "Want a match-day post draft?",
+                    f'Draft for review: "{match} — following the match? Contact {name} for current menu and ordering details."',
+                    ask_hi="Match-day post ka draft banaun?")
+    if kind == "supply_alert":
+        molecule, batches = text(p.get("molecule")), p.get("affected_batches", [])
+        if not molecule or not isinstance(batches, list) or not batches or not all(isinstance(x, str) for x in batches):
+            return None
+        fact = f"Supply alert: {molecule}, batches {', '.join(batches)}"
+        if text(p.get("manufacturer")):
+            fact += f", manufacturer {p['manufacturer']}"
+        item = digest_item(cat, trg)
+        if item and text(item.get("source")):
+            fact += f" — {item['source']}"
+        fact += ". Check these identifiers against your stock and dispensing records."
+        return Plan(fact, "Want a batch-check workflow?",
+                    f"Batch-check workflow: locate {', '.join(batches)} in stock and dispensing records; verify the supplier's notice; follow its replacement instructions. Customer exposure cannot be determined from aggregate counts.",
+                    ask_hi="Batch-check workflow bhejun?")
+    if kind == "category_seasonal":
+        trends = p.get("trends")
+        if not isinstance(trends, list) or not trends or not all(isinstance(t, str) for t in trends):
+            return None
+        fact = f"{label(p.get('season'))} category trends: {'; '.join(label(t) for t in trends[:3])}."
+        return Plan(fact, "Want a stock-review checklist?", "Stock-review checklist: compare these demand signals with current stock, expiry dates and recent sales before changing orders.", ask_hi="Stock-review checklist bhejun?")
+    if kind == "competitor_opened":
+        competitor = text(p.get("competitor_name"))
+        if not competitor:
+            return None
+        fact = f"Nearby opening: {competitor}"
+        if number(p.get("distance_km")):
+            fact += f", {p['distance_km']} km away"
+        if text(p.get("their_offer")):
+            fact += f". Their listed offer: {p['their_offer']}"
+        return Plan(fact + ".", "Want a profile comparison checklist?", f"Comparison checklist: compare {competitor}'s published services and hours with your listing; highlight your actual services. " + active, ask_hi="Profile comparison checklist bhejun?")
+    if kind == "gbp_unverified":
+        if (m.get("identity") or {}).get("verified") is not False:
+            return None
+        path = label(p.get("verification_path"))
+        fact = "Your Google profile is unverified." + (f" Recorded verification route: {path}." if path else "")
+        return Plan(fact, "Want the verification steps?", f"Verification steps: open your Google Business Profile, select verification and follow the offered method{': ' + path if path else ''}. Approval must come from Google.", ask_hi="Verification steps bhejun?")
+    if kind in {"renewal_due", "winback_eligible"}:
+        sub = m.get("subscription") or {}
+        days = p.get("days_remaining", sub.get("days_remaining")) if kind == "renewal_due" else p.get("days_since_expiry", sub.get("days_since_expiry"))
+        if not number(days):
+            return None
+        plan_name = text(p.get("plan")) or text(sub.get("plan"))
+        fact = f"Your {plan_name} plan " + (f"has {days} days remaining." if kind == "renewal_due" else f"expired {days} days ago.")
+        if number(p.get("renewal_amount")):
+            fact += f" Renewal amount: ₹{p['renewal_amount']:,}."
+        return Plan(fact, "Want a renewal request draft?", f'Renewal request draft: "Please confirm renewal terms for {name}. {fact}" Payment and renewal require confirmation from the provider.', ask_hi="Renewal request ka draft banaun?")
+    if kind == "milestone_reached":
+        value, target = p.get("value_now"), p.get("milestone_value")
+        metric = label(p.get("metric"))
+        if not number(value) or not metric:
+            return None
+        fact = f"{name} is at {value} {metric}."
+        if p.get("is_imminent") is True and number(target) and target > value:
+            fact += f" {target - value:g} more to reach {target}."
+        return Plan(fact, "Want a thank-you post draft?", f'Thank-you draft: "{name} is at {value} {metric}. Thank you for sharing your experience with us."', ask_hi="Thank-you post ka draft banaun?")
+    if kind == "review_theme_emerged":
+        count, theme = p.get("occurrences_30d"), label(p.get("theme"))
+        if not number(count) or not theme:
+            return None
+        fact = f"{count} reviews in the last 30 days mention {theme}."
+        if text(p.get("common_quote")):
+            fact += f' Example: "{p["common_quote"]}".'
+        return Plan(fact, "Want a response and process-check draft?", f'Review response draft: "Thank you for your feedback about {theme}. We would like to understand your experience." Process check: review the relevant recent service records before deciding a change.', ask_hi="Review response aur process-check draft banaun?")
+    if kind == "dormant_with_vera":
+        days = p.get("days_since_last_merchant_message")
+        if not number(days):
+            return None
+        topic = label(p.get("last_topic"))
+        return Plan(f"It has been {days} days since your last message." + (f" Last topic: {topic}." if topic else ""), "Want a brief account recap?", f"Account recap for {name}: " + (active or "No active offer is recorded in the current context."), ask_hi="Account ka short recap bhejun?")
+    if kind in {"curious_ask_due", "scheduled_recurring"}:
+        if p.get("ask_template") != "what_service_in_demand_this_week":
+            return None
+        return Plan(f"Weekly check-in for {name}.", "Which service did customers ask for most this week?", "", "open_ended", "Is hafte customers ne sabse zyada kaunsi service poochhi?")
+    if kind == "active_planning_intent":
+        topic = label(p.get("intent_topic"))
+        if not topic:
+            return None
+        draft = (f"Draft for review — {topic} at {name}:\n"
+                 "Service/package: [confirm scope]\nPrice: [confirm price]\nSchedule and capacity: [confirm availability].")
+        if active:
+            draft += f"\nReference only — {active} Package pricing is still to be decided."
+        return Plan(draft, "", draft, "none", "")
+    # Whitelisted factual headline only, never serialize arbitrary payloads or IDs.
+    headline = text(p.get("headline")) or text(p.get("title"))
+    if headline:
+        return Plan(f"Update: {headline}.", "", f"Available update: {headline}.", "none", "")
     return None
 
 
-class Composed:
-    __slots__ = ("body", "cta", "send_as", "suppression_key", "rationale",
-                 "template_name", "template_params")
-
-    def __init__(self, body, cta, send_as, suppression_key, rationale,
-                 template_name, template_params):
-        self.body = body
-        self.cta = cta
-        self.send_as = send_as
-        self.suppression_key = suppression_key
-        self.rationale = rationale
-        self.template_name = template_name
-        self.template_params = template_params
-
-
-# ---------------------------------------------------------------- handlers ---
-
-def h_research_digest(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    item = _find_digest(cat, p.get("top_item_id"))
-    if not item:
-        return None
-    who = _owner(m)
-    bits = [f"{who}, {item.get('source', 'this week')} landed."]
-    fact = item.get("title", "")
-    extra = []
-    if item.get("trial_n"):
-        extra.append(f"{item['trial_n']:,}-patient trial")
-    if item.get("patient_segment"):
-        seg = str(item["patient_segment"]).replace("_", " ")
-        if seg in " ".join(m.get("signals", [])).replace("_", " "):
-            extra.append(f"relevant to your {seg} cohort")
-    line = fact
-    if extra:
-        line = f"{fact} — {'; '.join(extra)}"
-    body = (
-        f"{who}, {item.get('source', 'new research')} just dropped. One item for you: "
-        f"{line}. Worth a 2-min look. Want me to pull it and draft a patient-ed "
-        f"WhatsApp you can share? — {item.get('source', 'source on file')}"
-    )
-    return Composed(
-        body=body, cta="open_ended", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale=(
-            f"External research digest item {item.get('id')} matches merchant category "
-            f"and cohort signals; open CTA invites the next step without friction."
-        ),
-        template_name="vera_research_digest_v1",
-        template_params=[_owner(m), item.get("source", ""), item.get("title", "")],
-    )
-
-
-def h_regulation_change(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    item = _find_digest(cat, p.get("top_item_id"))
-    if not item:
-        return None
-    deadline = p.get("deadline_iso") or item.get("summary", "")
-    summary = item.get("summary", item.get("title", ""))
-    body = (
-        f"{_owner(m)}, compliance heads-up: {item.get('title', 'a regulation update')} "
-        f"({item.get('source', '')}). {summary}"
-        + (f" Effective {deadline}." if deadline and "effective" not in str(deadline).lower() else "")
-        + " Want a checklist to see if your setup already complies?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Compliance deadline with cited source; binary CTA offers a concrete, low-effort next step.",
-        template_name="vera_compliance_update_v1",
-        template_params=[_owner(m), item.get("title", ""), str(deadline)],
-    )
-
-
-def h_cde_opportunity(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    item = _find_digest(cat, p.get("digest_item_id"))
-    if not item:
-        return None
-    fee = p.get("fee", "")
-    credits = p.get("credits")
-    body = (
-        f"{_owner(m)}, {item.get('title', 'a CDE session')} — {item.get('source', 'details on file')}. "
-        + (f"{credits} credit(s), " if credits else "")
-        + (f"{fee}. " if fee else "")
-        + "Shall I reserve you a seat?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="CDE opportunity from category digest with credits/fee facts; single binary CTA.",
-        template_name="vera_cde_invite_v1",
-        template_params=[_owner(m), item.get("title", ""), str(credits or "")],
-    )
-
-
-def h_perf_spike(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    metric = p.get("metric", "views")
-    delta = _pct(p.get("delta_pct"))
-    base = p.get("vs_baseline")
-    driver = p.get("likely_driver", "").replace("_", " ")
-    body = (
-        f"{_owner(m)}, good news — your {metric} are {delta} this week"
-        + (f" vs your {base} avg" if base else "")
-        + (f", likely from the {driver} post" if driver else "")
-        + f". {_merchant_name(m)} is getting noticed right now. Want me to draft a follow-up post to ride this wave while it lasts?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Internal perf spike with exact metric/delta; momentum framing plus one binary ask.",
-        template_name="vera_perf_update_v1",
-        template_params=[_owner(m), metric, delta],
-    )
-
-
-def h_perf_dip(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    metric = p.get("metric", "calls")
-    delta = _pct(p.get("delta_pct"))
-    window = p.get("window", "7d")
-    base = p.get("vs_baseline")
-    body = (
-        f"{_owner(m)}, quick flag: your {metric} dropped {delta} over the last {window}"
-        + (f" (from ~{base}/week)" if base else "")
-        + ". Profile and offers look intact, so this is likely ranking drift. "
-        + "Want me to run a 5-point profile check and tell you what to fix first?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Internal perf dip acknowledged with numbers before proposing the fix; avoids alarm tone.",
-        template_name="vera_perf_update_v1",
-        template_params=[_owner(m), metric, delta],
-    )
-
-
-def h_seasonal_perf_dip(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    metric = p.get("metric", "views")
-    delta = _pct(p.get("delta_pct"))
-    note = str(p.get("season_note", "")).replace("_", " ")
-    body = (
-        f"{_owner(m)}, your {metric} are {delta} this week — that matches the seasonal "
-        f"pattern ({note}) rather than anything you did. Peers see the same curve. "
-        + "Want 2 counter-seasonal post ideas to hold visibility till it turns?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Seasonal dip framed as expected (per trigger payload is_expected_seasonal) with a constructive offer.",
-        template_name="vera_perf_update_v1",
-        template_params=[_owner(m), metric, delta],
-    )
-
-
-def h_festival_upcoming(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    fest = p.get("festival", "the festival")
-    days = p.get("days_until")
-    offers = _active_offers(m)
-    offer_line = ""
-    if offers:
-        offer_line = f" You have '{offers[0].get('title')}' active — we can anchor the campaign on it."
-    when = f"on {p.get('date', '')}" if p.get("date") else ""
-    body = (
-        f"{_owner(m)}, {fest} is coming up {when}"
-        + (f" — {days} days out" if isinstance(days, int) else "")
-        + f". Booking intent for {fest} peaks about 2 weeks before. {offer_line} "
-        + f"Want me to draft a {fest} campaign for {_merchant_name(m)}?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Festival trigger with date + active merchant offer as the anchor; timely and specific.",
-        template_name="vera_opportunity_v1",
-        template_params=[_owner(m), fest, str(days or "")],
-    )
-
-
-def h_ipl_match_today(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    match = p.get("match", "today's match")
-    venue = p.get("venue", "")
-    time = str(p.get("match_time_iso", ""))[11:16]
-    body = (
-        f"{_owner(m)}, {match} at {venue} today"
-        + (f" around {time} IST" if time and time != "00:00" else "")
-        + ". Match evenings reliably spike delivery orders nearby. "
-        + "Want me to push a quick match-evening post for your listing?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Same-day local event with venue/time facts; urgency-appropriate single ask.",
-        template_name="vera_opportunity_v1",
-        template_params=[_owner(m), match, venue],
-    )
-
-
-def h_category_seasonal(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    season = str(p.get("season", "")).replace("_", " ")
-    trends = p.get("trends", [])
-    top = trends[0].replace("_", " ") if trends else ""
-    body = (
-        f"{_owner(m)}, {season} demand shift is visible in your category: "
-        f"{', '.join(t.replace('_', ' ') for t in trends[:3])}. "
-        + ("Shelf action recommended now. " if p.get("shelf_action_recommended") else "")
-        + "Want the full trend list with a stocking plan?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Category trend signal with concrete numbers; positions Vera as a knowledgeable peer.",
-        template_name="vera_opportunity_v1",
-        template_params=[_owner(m), season, top],
-    )
-
-
-def h_competitor_opened(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    name = p.get("competitor_name", "a new competitor")
-    dist = p.get("distance_km")
-    offer = p.get("their_offer", "")
-    body = (
-        f"{_owner(m)}, heads-up: {name} opened"
-        + (f" {dist} km away" if dist else "")
-        + (" — their listing shows '" + offer + "'" if offer else "")
-        + ". Your rating and reviews are still stronger. "
-        + "Want me to refresh your profile so you keep the edge in local search?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Competitor trigger using only supplied facts; reassures with merchant's real strengths.",
-        template_name="vera_risk_opportunity_v1",
-        template_params=[_owner(m), name, str(dist or "")],
-    )
-
-
-def h_gbp_unverified(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    uplift = _pct(p.get("estimated_uplift_pct"))
-    path = str(p.get("verification_path", "")).replace("_", " / ")
-    body = (
-        f"{_owner(m)}, your Google profile is still unverified — verified listings get "
-        f"~{uplift} more discovery calls. Verification takes one {path}. "
-        + "Shall I walk you through it? It's a 5-minute job."
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Concrete fixable gap with estimated uplift from trigger payload; effort externalized.",
-        template_name="vera_risk_opportunity_v1",
-        template_params=[_owner(m), path, uplift],
-    )
-
-
-def h_winback_eligible(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    days = p.get("days_since_expiry")
-    dip = _pct(p.get("perf_dip_pct"))
-    lapsed = p.get("lapsed_customers_added_since_expiry")
-    body = (
-        f"{_owner(m)}, your plan lapsed {days} days ago and views are {dip} since — "
-        f"{lapsed} lapsed customers came looking in that window but couldn't reach your offers. "
-        + "Renewing now reactivates all of them. Want me to restart your plan?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Winback with loss-aversion framing using trigger's exact numbers.",
-        template_name="vera_risk_opportunity_v1",
-        template_params=[_owner(m), str(days), dip],
-    )
-
-
-def h_milestone_reached(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    metric = str(p.get("metric", "reviews")).replace("_", " ")
-    now_v = p.get("value_now")
-    target = p.get("milestone_value")
-    if p.get("is_imminent") and target:
-        body = (
-            f"{_owner(m)}, you're at {now_v} {metric} — just {target - now_v} away from "
-            f"the {target} milestone. Crossing it boosts your ranking badge. "
-            + "Want 2 quick ways to nudge happy customers for the last few reviews?"
-        )
+def customer_plan(cat, m, trg, cust, now=None):
+    p, kind = trg.get("payload") or {}, trg.get("kind")
+    slots = slot_labels(p, now)
+    if kind == "recall_due":
+        service = label(p.get("service_due"))
+        if not service:
+            return None
+        fact = f"Reminder for {service}" + (f", due {p['due_date']}" if text(p.get("due_date")) else "") + "."
+        if text(p.get("last_service_date")):
+            fact += f" Last recorded service: {p['last_service_date']}."
+    elif kind == "appointment_tomorrow":
+        appointment = text(p.get("appointment_at")) or text(p.get("appointment_time_iso")) or text(p.get("appointment_iso"))
+        if not appointment:
+            return None
+        fact = f"Appointment reminder: {appointment}."
+    elif kind == "trial_followup":
+        if not text(p.get("trial_date")):
+            return None
+        fact = f"Following up on your trial on {p['trial_date']}."
+    elif kind in {"wedding_package_followup", "bridal_followup"}:
+        if not text(p.get("wedding_date")):
+            return None
+        fact = f"Following up on your wedding plans for {p['wedding_date']}."
+        if text(p.get("next_step_window_open")):
+            fact += f" Proposed next step: {label(p['next_step_window_open'])}."
+    elif kind == "chronic_refill_due":
+        medicines = p.get("molecule_list")
+        if not isinstance(medicines, list) or not medicines or not all(isinstance(x, str) for x in medicines):
+            return None
+        fact = f"Refill reminder for {', '.join(medicines)}."
+        if text(p.get("stock_runs_out_iso")):
+            fact += f" Estimated supply end: {p['stock_runs_out_iso'][:10]}."
+        return Plan(fact, "Would you like the pharmacy to check your refill request?", "Refill request noted in this conversation. The pharmacist must check the prescription, stock, price and delivery before confirming.", ask_hi="Pharmacy se refill request check karwana chahenge?")
+    elif kind in {"customer_lapsed_soft", "customer_lapsed_hard", "winback_customer"}:
+        days = p.get("days_since_last_visit")
+        if not number(days):
+            return None
+        fact = f"It has been {days} days since your last visit. We'd be happy to welcome you back when it suits you."
     else:
-        body = (
-            f"{_owner(m)}, congratulations — {_merchant_name(m)} just crossed {now_v} {metric}! "
-            + "That's top-tier for your locality. Want me to draft a 'thank you' post to convert this into fresh bookings?"
-        )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Milestone with exact counts; social-proof + celebration framing.",
-        template_name="vera_nudge_v1",
-        template_params=[_owner(m), metric, str(now_v)],
-    )
-
-
-def h_review_theme_emerged(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    theme = str(p.get("theme", "")).replace("_", " ")
-    n = p.get("occurrences_30d")
-    quote = p.get("common_quote", "")
-    body = (
-        f"{_owner(m)}, {n} reviews this week mention '{theme}'"
-        + (f" — e.g. \"{quote}\"" if quote else "")
-        + ". It's fixable and worth catching early. Want a one-step plan to turn this theme around?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Review theme named with count and a real quote; measurable fix offered.",
-        template_name="vera_nudge_v1",
-        template_params=[_owner(m), theme, str(n)],
-    )
-
-
-def h_renewal_due(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    days = p.get("days_remaining", (m.get("subscription") or {}).get("days_remaining"))
-    plan = p.get("plan", (m.get("subscription") or {}).get("plan", ""))
-    amt = p.get("renewal_amount")
-    body = (
-        f"{_owner(m)}, your {plan} plan renews in {days} days"
-        + (f" (₹{amt:,})" if amt else "")
-        + f". Your current run rate: views and calls are holding, so continuity protects your ranking. "
-        + "Reply YES and I'll set up the renewal for you."
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Renewal nudge with plan, days and price from payload; single binary CTA.",
-        template_name="vera_nudge_v1",
-        template_params=[_owner(m), plan, str(days)],
-    )
-
-
-def h_dormant_with_vera(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    days = p.get("days_since_last_merchant_message")
-    last_topic = str(p.get("last_topic", "")).replace("_", " ")
-    body = (
-        f"{_owner(m)}, it's been {days} days since we last spoke (last topic: {last_topic}). "
-        + f"Meanwhile {_merchant_name(m)} got new views this week. "
-        + "Want a 30-second catch-up on the one thing worth doing first?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Re-engagement after dormancy with a curiosity hook, no guilt tone.",
-        template_name="vera_nudge_v1",
-        template_params=[_owner(m), last_topic, str(days)],
-    )
-
-
-def h_curious_ask_due(cat, m, trg, cust):
-    body = (
-        f"{_owner(m)}, quick question from your customers' side: what's the one service "
-        f"people asked for most at {_merchant_name(m)} this week? I ask because demand "
-        "signals in your area are shifting, and the top asker-category gets a visibility boost. "
-        "Curious what you're seeing."
-    )
-    return Composed(
-        body=body, cta="open_ended", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Curiosity/social-proof ask per trigger's ask_template; invites merchant knowledge.",
-        template_name="vera_nudge_v1",
-        template_params=[_owner(m), "weekly_ask"],
-    )
-
-
-def h_active_planning_intent(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    topic = str(p.get("intent_topic", "")).replace("_", " ")
-    offers = _active_offers(m)
-    offer_line = f" We can price it alongside '{offers[0].get('title')}'." if offers else ""
-    body = (
-        f"{_owner(m)}, picking up where we left off on {topic}. Here's a concrete draft: "
-        + f"a starter package with 3 items and one anchor price, ready to publish on your listing. {offer_line} "
-        + "Reply GO and I'll finalize the draft for your review."
-    )
-    return Composed(
-        body=body, cta="binary_confirm_cancel", send_as="vera",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Merchant already signaled planning intent; route skips discovery and presents an executable draft.",
-        template_name="vera_nudge_v1",
-        template_params=[_owner(m), topic],
-    )
-
-
-# ------------------------------------------------------- customer handlers ---
-
-def h_recall_due(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    name = _customer_name(cust)
-    service = str(p.get("service_due", "checkup")).replace("_", " ")
-    last = p.get("last_service_date", "")
-    slots = p.get("available_slots", [])
-    slot_labels = [s.get("label", "") for s in slots][:2]
-    offers = _active_offers(m)
-    price = offers[0].get("title") if offers else ""
-    months = ""
-    if last and p.get("due_date"):
-        months = "your 6-month recall is due"
-    body = (
-        f"Hi {name}, {_merchant_name(m)} here. It's been a while since your last visit"
-        + (f" ({last})" if last else "")
-        + f" — {months or f'your {service} is due'}. "
-        + (f"Slots: {' ya '.join(slot_labels)}. " if slot_labels and _is_hi(m) else (f"Slots: {' or '.join(slot_labels)}. " if slot_labels else ""))
-        + (f"{price}. " if price else "")
-        + (f"Reply 1 for {slot_labels[0]}, 2 for {slot_labels[1]}, or tell us a time that works." if len(slot_labels) == 2 else "Reply to book a time that works.")
-    )
-    return Composed(
-        body=body, cta="open_ended", send_as="merchant_on_behalf",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Consented recall reminder using customer name, last-visit date, real slots and the merchant's active offer price.",
-        template_name="merchant_recall_reminder_v1",
-        template_params=[name, _merchant_name(m)] + slot_labels,
-    )
-
-
-def h_trial_followup(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    name = _customer_name(cust)
-    trial = p.get("trial_date", "")
-    options = [s.get("label", "") for s in p.get("next_session_options", [])][:2]
-    body = (
-        f"Hi {name}, {_merchant_name(m)} here. Loved having you at the trial session"
-        + (f" on {trial}" if trial else "")
-        + (
-            (f". Next session: {options[0]}" + (f" or {options[1]}" if len(options) > 1 else "") + ". ")
-            if options else ". "
-        )
-        + "Shall I book you in? Just reply YES."
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="merchant_on_behalf",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Trial follow-up with real session options; warm merchant voice, single binary CTA.",
-        template_name="merchant_appointment_reminder_v1",
-        template_params=[name] + options,
-    )
-
-
-def h_wedding_package_followup(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    name = _customer_name(cust)
-    wedding = p.get("wedding_date", "")
-    days = p.get("days_to_wedding")
-    next_step = str(p.get("next_step_window_open", "")).replace("_", " ")
-    body = (
-        f"Hi {name}, {_merchant_name(m)} here. With your wedding on {wedding}"
-        + (f" ({days} days to go)" if isinstance(days, int) else "")
-        + f", now is the right window to start the {next_step}. "
-        + "Shall I share a 30-day plan tailored to your trial notes?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="merchant_on_behalf",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Wedding countdown follow-up using trigger dates and the named next-step window.",
-        template_name="merchant_appointment_reminder_v1",
-        template_params=[name, str(wedding), next_step],
-    )
-
-
-def h_customer_lapsed_hard(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    name = _customer_name(cust)
-    days = p.get("days_since_last_visit")
-    focus = str(p.get("previous_focus", "")).replace("_", " ")
-    months = p.get("previous_membership_months")
-    body = (
-        f"Hi {name}, {_merchant_name(m)} here. It's been {days} days since your last session"
-        + (f" — your {focus} progress from your {months}-month run was solid" if focus else "")
-        + ". We'd love to have you back"
-        + (f"; your first session back is on us this month" if _active_offers(m) else "")
-        + ". Want me to book you in?"
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="merchant_on_behalf",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Winback referencing the customer's own history; only if consent scope covers outreach.",
-        template_name="merchant_winback_v1",
-        template_params=[name, str(days), focus],
-    )
-
-
-def h_chronic_refill_due(cat, m, trg, cust):
-    p = trg.get("payload", {})
-    name = _customer_name(cust)
-    molecules = p.get("molecule_list", [])
-    last = p.get("last_refill", "")
-    runs_out = str(p.get("stock_runs_out_iso", ""))[:10]
-    saved = p.get("delivery_address_saved")
-    body = (
-        f"Hi {name}, {_merchant_name(m)} here. Your regular medicines"
-        + (f" ({', '.join(molecules)})" if molecules else "")
-        + (f" from your {last} refill" if last else "")
-        + (f" run out around {runs_out}" if runs_out else " are due for refill")
-        + (". Your saved address is on file" if saved else "")
-        + ". Shall we schedule the refill delivery? Reply YES and it's done."
-    )
-    return Composed(
-        body=body, cta="binary_yes_no", send_as="merchant_on_behalf",
-        suppression_key=trg.get("suppression_key", ""),
-        rationale="Consented refill reminder with molecule list, dates and saved-address fact; no medical claims.",
-        template_name="merchant_refill_reminder_v1",
-        template_params=[name, ", ".join(molecules), runs_out],
-    )
-
-
-HANDLERS = {
-    "research_digest": h_research_digest,
-    "regulation_change": h_regulation_change,
-    "cde_opportunity": h_cde_opportunity,
-    "perf_spike": h_perf_spike,
-    "perf_dip": h_perf_dip,
-    "seasonal_perf_dip": h_seasonal_perf_dip,
-    "festival_upcoming": h_festival_upcoming,
-    "ipl_match_today": h_ipl_match_today,
-    "category_seasonal": h_category_seasonal,
-    "competitor_opened": h_competitor_opened,
-    "gbp_unverified": h_gbp_unverified,
-    "winback_eligible": h_winback_eligible,
-    "milestone_reached": h_milestone_reached,
-    "review_theme_emerged": h_review_theme_emerged,
-    "renewal_due": h_renewal_due,
-    "dormant_with_vera": h_dormant_with_vera,
-    "curious_ask_due": h_curious_ask_due,
-    "active_planning_intent": h_active_planning_intent,
-    "recall_due": h_recall_due,
-    "trial_followup": h_trial_followup,
-    "wedding_package_followup": h_wedding_package_followup,
-    "customer_lapsed_hard": h_customer_lapsed_hard,
-    "chronic_refill_due": h_chronic_refill_due,
-}
-
-
-def compose(category: dict, merchant: dict, trigger: dict,
-            customer: Optional[dict] = None) -> Optional[Composed]:
-    """Route by kind, then compose. Returns None if facts are insufficient."""
-    kind = trigger.get("kind", "")
-    handler = HANDLERS.get(kind)
-    if handler is None:
-        return _generic_fallback(category, merchant, trigger, customer)
-    composed = handler(category, merchant, trigger, customer)
-    if composed is None:
-        composed = _generic_fallback(category, merchant, trigger, customer)
-    return composed
-
-
-def _generic_fallback(category, merchant, trigger, customer):
-    """Safe factual summary; only uses facts verbatim present in the payload."""
-    p = trigger.get("payload", {})
-    if not p:
         return None
-    fact_items = [f"{k.replace('_', ' ')}: {v}" for k, v in list(p.items())[:3]]
-    if trigger.get("scope") == "customer" and customer:
-        body = (
-            f"Hi {_customer_name(customer)}, {_merchant_name(merchant)} here. "
-            + "Update: " + "; ".join(fact_items) + ". Reply if you'd like to act on this."
-        )
-        send_as = "merchant_on_behalf"
+    if slots:
+        fact += " Listed options: " + " or ".join(slots) + "."
+        ask, hi, cta = "Which listed time would you prefer?", "Inmein se kaunsa time aapko suit karega?", "open_ended"
     else:
-        body = (
-            f"{_owner(merchant)}, quick update for you: " + "; ".join(fact_items)
-            + ". Want me to look into it?"
-        )
-        send_as = "vera"
-    return Composed(
-        body=body, cta="open_ended", send_as=send_as,
-        suppression_key=trigger.get("suppression_key", ""),
-        rationale="Unknown trigger kind; sent a low-risk factual summary from payload without invention.",
-        template_name="vera_generic_v1",
-        template_params=[_owner(merchant)],
-    )
+        ask, hi, cta = "Would you like to request a suitable time?", "Apne liye suitable time request karna chahenge?", "binary_yes_no"
+    return Plan(fact, ask, "Your request is noted in this conversation. Availability and booking still need confirmation from the business.", cta, hi)
+
+
+def compose(category, merchant, trigger, customer=None, *, now=None):
+    """Return a validated draft, or None when evidence/consent is insufficient."""
+    from .guardrails import validate
+    p = trigger.get("payload") or {}
+    if not category or not merchant or not p or p.get("placeholder") is True:
+        return None
+    mid, cid = trigger_ids(trigger)
+    if mid != merchant.get("merchant_id") or category.get("slug") != merchant.get("category_slug"):
+        return None
+    policy = get_policy(trigger.get("kind", ""))
+    scope = trigger.get("scope")
+    if scope not in {"merchant", "customer"} or scope != policy.audience:
+        return None
+    if now:
+        try:
+            if trigger.get("expires_at") and parse_time(trigger["expires_at"]) <= now:
+                return None
+            if trigger.get("not_before") and parse_time(trigger["not_before"]) > now:
+                return None
+        except (ValueError, TypeError):
+            return None
+    if scope == "customer":
+        if not customer or customer.get("merchant_id") != mid or customer.get("customer_id") != cid or not consent_allows(policy, customer, now):
+            return None
+        plan = customer_plan(category, merchant, trigger, customer, now)
+    else:
+        customer = None
+        plan = merchant_plan(category, merchant, trigger)
+    if not plan or not plan.fact:
+        return None
+    lang = language(merchant, customer)
+    ask = plan.ask_hi if lang == "hi" else plan.ask
+    if customer:
+        name = text((customer.get("identity") or {}).get("name"))
+        channel = (customer.get("preferences") or {}).get("channel", "")
+        if channel == "whatsapp_via_son":
+            name = f"family of {name}"
+        greeting = {"hi": "Namaste", "ta": "Vanakkam", "te": "Namaskaram", "kn": "Namaskara", "mr": "Namaskar"}.get(lang, "Hi")
+        opening = f"{greeting} {name}, {_merchant_name(merchant)} here."
+    else:
+        opening = f"{_owner(merchant)}," + (" ek update:" if lang == "hi" else "")
+    body = " ".join(x for x in (opening, plan.fact, ask) if x)
+    result = Composed(body, plan.cta, "merchant_on_behalf" if customer else "vera",
+                      text(trigger.get("suppression_key")),
+                      f"{trigger.get('kind')}: uses supplied event facts and current recipient context; "
+                      + ("purpose-specific consent checked." if customer else "offers a reviewable next step without claiming execution."),
+                      policy.template_name, [body], plan.fact, plan.next_step,
+                      [plan.fact])
+    return None if validate(result, category, merchant, trigger, customer) else result

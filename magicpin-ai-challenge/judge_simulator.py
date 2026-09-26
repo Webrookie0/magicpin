@@ -6,10 +6,8 @@ magicpin AI Challenge — LLM-Powered Judge Simulator
 A strict but fair judge that scores your bot and explains WHY.
 
 HOW TO USE:
-1. Edit the CONFIGURATION section below (lines 25-45)
-2. Set your LLM provider and API key
-3. Set your bot URL
-4. Run: python judge_simulator.py
+Run offline contract checks: python judge_simulator.py --offline --scenario all
+For LLM scoring set LLM_PROVIDER, LLM_API_KEY, LLM_MODEL and BOT_URL in the environment.
 
 That's it!
 
@@ -20,20 +18,24 @@ Author: magicpin AI Challenge Team
 # ██████  CONFIGURATION - EDIT THIS SECTION ██████
 # =============================================================================
 
+import os
+from app.config import load_env
+from app.rate_limits import retry_delay
+
 # Your bot's URL (where your bot is running)
-BOT_URL = "http://localhost:8080"
+BOT_URL = os.environ.get("BOT_URL", "http://localhost:8080")
 
 # Choose your LLM provider: "openai", "anthropic", "gemini", "deepseek", "groq", "ollama", "openrouter"
-LLM_PROVIDER = "openai"
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq")
 
-# Your API key (paste your key here)
-LLM_API_KEY = ""  # <-- PUT YOUR API KEY HERE
+# Credentials stay outside source control.
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "") or (os.environ.get("GROQ_API_KEY", "") if LLM_PROVIDER == "groq" else "")
 
 # Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
-LLM_MODEL = ""  # <-- Optional: specify model or leave empty for default
+LLM_MODEL = os.environ.get("LLM_MODEL", "")
 
 # For Ollama only: local server URL
-OLLAMA_URL = "http://localhost:11434"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
 # Which test to run by default
 TEST_SCENARIO = "all"
@@ -48,7 +50,7 @@ import json
 import time
 import re
 import socket
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
@@ -57,7 +59,8 @@ from abc import ABC, abstractmethod
 
 # Constants
 TIMEOUT_LLM = 45
-DATASET_DIR = Path(__file__).parent / "dataset"
+DATASET_DIR = Path(__file__).parent / "dataset" / "expanded"
+SIMULATED_NOW = "2026-04-26T10:00:00Z"
 
 # =============================================================================
 # TERMINAL OUTPUT
@@ -256,12 +259,15 @@ class DeepSeekProvider(LLMProvider):
 class GroqProvider(LLMProvider):
     def __init__(self, api_key: str, model: str = ""):
         self.api_key = api_key
-        self.model = model or "llama-3.1-70b-versatile"
+        self.model = model or "qwen/qwen3.8-27b"
+        self.blocked_until = 0
 
     def name(self) -> str:
         return f"Groq ({self.model})"
 
     def complete(self, prompt: str, system: str = None) -> str:
+        if time.monotonic() < self.blocked_until:
+            raise RuntimeError("Groq scoring deferred until Retry-After expires")
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -273,7 +279,12 @@ class GroqProvider(LLMProvider):
                             "temperature": 0.2, "max_tokens": 1500}).encode("utf-8"),
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         )
-        resp = urlrequest.urlopen(req, timeout=TIMEOUT_LLM)
+        try:
+            resp = urlrequest.urlopen(req, timeout=TIMEOUT_LLM)
+        except urlerror.HTTPError as exc:
+            if exc.code == 429:
+                self.blocked_until = time.monotonic() + retry_delay(exc.headers.get("retry-after"))
+            raise
         data = json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"]
 
@@ -358,34 +369,26 @@ class DatasetLoader:
 
     def load(self) -> bool:
         try:
-            cat_dir = self.dataset_dir / "categories"
-            if cat_dir.exists():
-                for f in cat_dir.glob("*.json"):
-                    data = json.load(open(f))
-                    self.categories[data.get("slug", f.stem)] = data
-
-            for name, container, key in [
-                ("merchants_seed.json", "merchants", "merchant_id"),
-                ("customers_seed.json", "customers", "customer_id"),
-                ("triggers_seed.json", "triggers", "id")
-            ]:
-                path = self.dataset_dir / name
-                if path.exists():
-                    data = json.load(open(path))
-                    items = data.get(container, data.get(container.rstrip("s"), []))
-                    storage = getattr(self, container)
-                    for item in items:
-                        if key in item:
-                            storage[item[key]] = item
-            return True
-        except Exception as e:
-            print_fail(f"Dataset load error: {e}")
+            for folder, key in [("categories", "slug"), ("merchants", "merchant_id"),
+                                ("customers", "customer_id"), ("triggers", "id")]:
+                storage = getattr(self, folder)
+                files = sorted((self.dataset_dir / folder).glob("*.json"))
+                items = [json.loads(f.read_text(encoding="utf-8")) for f in files]
+                seed = self.dataset_dir / f"{folder}_seed.json"
+                if not items and seed.exists():
+                    items = json.loads(seed.read_text(encoding="utf-8"))[folder]
+                for item in items:
+                    storage[item[key]] = item
+            return all((self.categories, self.merchants, self.customers, self.triggers))
+        except (OSError, ValueError, KeyError) as exc:
+            print_fail(f"Dataset load error: {exc}")
             return False
 
 
 class BotClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
+        self.now = datetime.fromisoformat(SIMULATED_NOW.replace("Z", "+00:00"))
 
     def _request(self, method: str, path: str, timeout: int = 30,
                  body_dict: Dict = None) -> Tuple[Optional[Dict], Optional[str], float]:
@@ -393,6 +396,8 @@ class BotClient:
         start = time.time()
         body = json.dumps(body_dict).encode("utf-8") if body_dict else None
         headers = {"Content-Type": "application/json"}
+        if os.environ.get("VERA_API_TOKEN"):
+            headers["Authorization"] = "Bearer " + os.environ["VERA_API_TOKEN"]
         req = urlrequest.Request(url, data=body, method=method, headers=headers)
 
         try:
@@ -403,7 +408,7 @@ class BotClient:
             if e.code == 401:
                 return None, "Unauthorized", latency
             try:
-                return json.loads(e.read().decode("utf-8")), None, latency
+                return json.loads(e.read().decode("utf-8")), f"HTTP {e.code}", latency
             except:
                 return None, f"HTTP {e.code}", latency
         except Exception as e:
@@ -418,19 +423,21 @@ class BotClient:
     def push_context(self, scope, cid, version, payload):
         return self._request("POST", "/v1/context", 10, {
             "scope": scope, "context_id": cid, "version": version,
-            "payload": payload, "delivered_at": datetime.utcnow().isoformat() + "Z"
+            "payload": payload, "delivered_at": self.now.isoformat()
         })
 
     def tick(self, triggers):
+        self.now += timedelta(minutes=5)
         return self._request("POST", "/v1/tick", 15, {
-            "now": datetime.utcnow().isoformat() + "Z", "available_triggers": triggers
+            "now": self.now.isoformat(), "available_triggers": triggers
         })
 
-    def reply(self, conv_id, merchant_id, message, turn):
+    def reply(self, conv_id, merchant_id, message, turn, customer_id=None):
+        self.now += timedelta(seconds=1)
         return self._request("POST", "/v1/reply", 15, {
-            "conversation_id": conv_id, "merchant_id": merchant_id, "customer_id": None,
-            "from_role": "merchant", "message": message,
-            "received_at": datetime.utcnow().isoformat() + "Z", "turn_number": turn
+            "conversation_id": conv_id, "merchant_id": merchant_id, "customer_id": customer_id,
+            "from_role": "customer" if customer_id else "merchant", "message": message,
+            "received_at": self.now.isoformat(), "turn_number": turn
         })
 
 # =============================================================================
@@ -500,10 +507,15 @@ RESPOND ONLY WITH THIS EXACT JSON FORMAT:
         """Score a message and return detailed results."""
 
         body = action.get("body", "")
+        if self.llm is None:
+            result = self._fallback_score(action)
+            result.hint = "OFFLINE heuristic only; this is not an LLM quality evaluation."
+            return result
 
         prompt = f"""SCORE THIS MESSAGE:
 
 === CONTEXT PROVIDED TO BOT ===
+Full category context: {json.dumps(category, ensure_ascii=False)}
 Category: {category.get('slug', 'unknown')}
 Voice: {category.get('voice', {}).get('tone', 'unknown')}
 Taboos: {category.get('voice', {}).get('vocab_taboo', [])[:5]}
@@ -520,7 +532,7 @@ Trigger Kind: {trigger.get('kind', 'unknown')}
 Trigger Payload: {json.dumps(trigger.get('payload', {}))}
 Trigger Urgency: {trigger.get('urgency', '?')}
 
-Customer: {json.dumps(customer.get('identity', {})) if customer else 'None (merchant-facing)'}
+Customer: {json.dumps(customer) if customer else 'None (merchant-facing)'}
 
 === BOT'S MESSAGE ===
 Body ({len(body)} chars): "{body}"
@@ -592,7 +604,7 @@ class JudgeSimulator:
     def run(self, scenario: str) -> bool:
         print_header(f"LLM JUDGE — {scenario.upper()}")
         print_info(f"Bot: {BOT_URL}")
-        print_info(f"LLM: {self.llm.name()}")
+        print_info(f"Scorer: {self.llm.name() if self.llm else 'OFFLINE heuristics (not an LLM judge)'}")
 
         if not self.dataset.load():
             print_fail("Dataset load failed")
@@ -643,13 +655,18 @@ class JudgeSimulator:
             status = "PASS" if data and data.get("accepted") else "FAIL"
             print(f"  [{status}] category/{slug}")
 
-        for mid, m in list(self.dataset.merchants.items())[:5]:
-            data, err, _ = self.client.push_context("merchant", mid, 1, m)
-            status = "PASS" if data and data.get("accepted") else "FAIL"
-            short_id = mid.split('_')[1] if '_' in mid else mid[:10]
-            print(f"  [{status}] merchant/{short_id}")
-
-        return True
+        for scope, collection in [("merchant", self.dataset.merchants), ("customer", self.dataset.customers)]:
+            for cid, payload in collection.items():
+                data, err, _ = self.client.push_context(scope, cid, 1, payload)
+                if not data or (not data.get("accepted") and data.get("reason") != "stale_version"):
+                    print_fail(f"Context push failed: {scope}/{cid}: {err}")
+                    return False
+        data, err, _ = self.client.healthz()
+        expected = {"category": len(self.dataset.categories), "merchant": len(self.dataset.merchants),
+                    "customer": len(self.dataset.customers)}
+        ok = not err and all(data.get("contexts_loaded", {}).get(k) == v for k, v in expected.items())
+        (print_success if ok else print_fail)(f"Warmup counts: {data.get('contexts_loaded', {})}")
+        return ok
 
     def _phase2_short(self) -> bool:
         if not self._warmup():
@@ -678,113 +695,62 @@ class JudgeSimulator:
 
         return True
 
+    def _start_replay(self):
+        self.client._request("POST", "/v1/teardown")
+        if not self._warmup():
+            return None
+        trigger = next(t for t in self.dataset.triggers.values()
+                       if t["kind"] == "research_digest" and not t["payload"].get("placeholder"))
+        self.client.push_context("trigger", trigger["id"], 1, trigger)
+        data, err, _ = self.client.tick([trigger["id"]])
+        if err or not data.get("actions"):
+            print_fail("Replay did not initiate a real conversation")
+            return None
+        return data["actions"][0]
+
     def _auto_reply(self) -> bool:
         print_section("AUTO-REPLY DETECTION")
-
-        data, err, _ = self.client.healthz()
-        if err:
-            print_fail(f"Bot unreachable: {err}")
+        action = self._start_replay()
+        if not action:
             return False
-
-        mid = list(self.dataset.merchants.keys())[0] if self.dataset.merchants else "m_test"
-        auto_msg = "Thank you for contacting us! Our team will respond shortly."
-
-        for i in range(1, 5):
-            print_info(f"Turn {i}: Sending auto-reply...")
-            data, err, _ = self.client.reply(f"conv_auto_{i}", mid, auto_msg, i + 1)
-
+        moves = []
+        for turn in range(2, 6):
+            data, err, _ = self.client.reply(action["conversation_id"], action["merchant_id"],
+                                            "Thank you for contacting us! Our team will respond shortly.", turn)
             if err:
-                print_fail(f"Error: {err}")
+                print_fail(err)
                 return False
-
-            action = data.get("action", "?")
-
-            if action == "end":
-                print_success(f"Turn {i}: Bot ENDED — detected auto-reply pattern!")
-                return True
-            elif action == "wait":
-                wait_s = data.get("wait_seconds", "?")
-                print_success(f"Turn {i}: Bot WAITING {wait_s}s")
-            else:
-                body = data.get("body", "")[:50]
-                print_warn(f"Turn {i}: Bot sent: \"{body}...\"")
-
-        print_warn("Bot never ended after 4 auto-replies")
-        return True
+            moves.append(data.get("action"))
+        passed = moves[0] in {"send", "wait"} and moves[1] in {"wait", "end"} and moves[2:] == ["end", "end"]
+        (print_success if passed else print_fail)(f"Auto-reply moves: {moves}")
+        return passed
 
     def _intent(self) -> bool:
         print_section("INTENT TRANSITION")
-
-        data, err, _ = self.client.healthz()
-        if err:
-            print_fail(f"Bot unreachable: {err}")
+        action = self._start_replay()
+        if not action:
             return False
-
-        mid = list(self.dataset.merchants.keys())[0] if self.dataset.merchants else "m_test"
-        commitment = "Ok lets do it. Whats next?"
-
-        print_info(f"Merchant: \"{commitment}\"")
-        data, err, _ = self.client.reply("conv_intent_1", mid, commitment, 2)
-
-        if err:
-            print_fail(f"Error: {err}")
-            return False
-
-        action = data.get("action", "?")
-        body = data.get("body", "")
-
-        print_info(f"Bot action: {action}")
-        if body:
-            print_info(f"Bot body: \"{body[:100]}{'...' if len(body) > 100 else ''}\"")
-
-        qualifying = ["would you", "do you", "can you tell", "what if", "how about"]
-        actioning = ["done", "sending", "draft", "here", "confirm", "proceed", "next"]
-
-        body_lower = body.lower()
-        if any(w in body_lower for w in actioning) and not any(w in body_lower for w in qualifying):
-            print_success("Bot correctly switched to ACTION mode")
-        elif any(w in body_lower for w in qualifying):
-            print_fail("Bot is STILL QUALIFYING after commitment")
-        else:
-            print_warn("Response unclear")
-
-        return True
+        self.client.reply(action["conversation_id"], action["merchant_id"], "What are the details?", 2)
+        data, err, _ = self.client.reply(action["conversation_id"], action["merchant_id"], "Ok lets do it. Whats next?", 3)
+        body = data.get("body", "") if data else ""
+        passed = not err and data.get("action") == "send" and "?" not in body and any(x in body.lower() for x in ("draft", "checklist", "summary"))
+        (print_success if passed else print_fail)(f"Intent response: {body[:150]}")
+        return passed
 
     def _hostile(self) -> bool:
         print_section("HOSTILE HANDLING")
-
-        data, err, _ = self.client.healthz()
-        if err:
-            print_fail(f"Bot unreachable: {err}")
+        action = self._start_replay()
+        if not action:
             return False
-
-        mid = list(self.dataset.merchants.keys())[0] if self.dataset.merchants else "m_test"
-        hostile = "Stop messaging me. This is useless spam."
-
-        print_info(f"Merchant (hostile): \"{hostile}\"")
-        data, err, _ = self.client.reply("conv_hostile", mid, hostile, 2)
-
-        if err:
-            print_fail(f"Error: {err}")
-            return False
-
-        action = data.get("action", "?")
-        body = data.get("body", "")
-
-        print_info(f"Bot action: {action}")
-
-        if action == "end":
-            print_success("Bot correctly ENDED on hostile message")
-        elif action == "send" and any(w in body.lower() for w in ["sorry", "apolog", "won't"]):
-            print_success("Bot apologized gracefully")
-        else:
-            print_fail("Bot didn't handle hostility well")
-
-        return True
+        data, err, _ = self.client.reply(action["conversation_id"], action["merchant_id"], "Stop messaging me. This is useless spam.", 2)
+        later, later_err, _ = self.client.reply(action["conversation_id"], action["merchant_id"], "Can you file my GST?", 3)
+        passed = not err and not later_err and data.get("action") == later.get("action") == "end"
+        (print_success if passed else print_fail)("Opt-out remains closed on later replies")
+        return passed
 
     def _all(self) -> bool:
         results = []
-        for name, fn in [("warmup", self._warmup), ("auto_reply", self._auto_reply),
+        for name, fn in [("phase2", self._phase2_short), ("auto_reply", self._auto_reply),
                          ("intent", self._intent), ("hostile", self._hostile)]:
             try:
                 results.append((name, fn()))
@@ -804,31 +770,29 @@ class JudgeSimulator:
 
         print_section("FULL EVALUATION")
 
-        for mid, m in self.dataset.merchants.items():
-            self.client.push_context("merchant", mid, 1, m)
-        for tid, t in self.dataset.triggers.items():
-            self.client.push_context("trigger", tid, 1, t)
+        for tid, trigger in self.dataset.triggers.items():
+            self.client.push_context("trigger", tid, 1, trigger)
 
         print_success("All contexts pushed")
 
         print_section("SCORING COMPOSITIONS")
         tids = list(self.dataset.triggers.keys())
 
-        for i in range(0, len(tids), 5):
-            batch = tids[i:i+5]
+        for i in range(len(tids)):
+            batch = tids[i:i+1]
             data, err, lat = self.client.tick(batch)
 
             if err:
-                print_warn(f"Tick failed: {err}")
-                continue
+                print_fail(f"Tick failed: {err}")
+                return False
 
             actions = data.get("actions", [])
-            print_info(f"Batch {i//5 + 1}: {len(actions)} actions ({lat:.0f}ms)")
+            print_info(f"Batch {i + 1}: {len(actions)} actions ({lat:.0f}ms)")
 
             for action in actions:
                 self._score_and_display(action, verbose=False)
 
-        return True
+        return bool(self.all_scores)
 
     def _score_and_display(self, action: Dict, verbose: bool = True):
         """Score an action and display results."""
@@ -890,7 +854,7 @@ class JudgeSimulator:
             merchant_fit=sum(s.merchant_fit for s in self.all_scores) // n,
             decision_quality=sum(s.decision_quality for s in self.all_scores) // n,
             engagement_compulsion=sum(s.engagement_compulsion for s in self.all_scores) // n,
-            penalties=sum(s.penalties for s in self.all_scores)
+            penalties=sum(s.penalties for s in self.all_scores) // n
         )
 
         print_info(f"Messages scored: {n}\n")
@@ -920,41 +884,36 @@ class JudgeSimulator:
 # =============================================================================
 
 def main():
-    print_header("magicpin AI Challenge — LLM Judge")
-
-    # Validate configuration
-    if LLM_PROVIDER != "ollama" and not LLM_API_KEY:
-        print_fail("LLM_API_KEY is not set!")
-        print_info("Edit the CONFIGURATION section at the top of this file")
-        print_info("Set your API key for your chosen provider")
-        sys.exit(1)
-
-    # Create LLM provider
+    import argparse
+    from app.timeutils import parse_time
+    global DATASET_DIR, SIMULATED_NOW
+    parser = argparse.ArgumentParser(description="Contract replays plus optional LLM scoring")
+    parser.add_argument("--offline", action="store_true", help="No provider calls; explicitly labeled heuristic scores")
+    parser.add_argument("--scenario", default=TEST_SCENARIO, choices=["warmup", "phase2_short", "auto_reply_hell", "intent_transition", "hostile", "all", "full_evaluation"])
+    parser.add_argument("--now", default=SIMULATED_NOW, help="Timezone-aware simulated timestamp")
+    parser.add_argument("--dataset", type=Path, default=DATASET_DIR)
+    args = parser.parse_args()
     try:
+        parse_time(args.now)
+    except ValueError as exc:
+        parser.error(str(exc))
+    DATASET_DIR, SIMULATED_NOW = args.dataset, args.now
+    if args.offline:
+        llm = None
+    else:
+        if LLM_PROVIDER != "ollama" and not LLM_API_KEY:
+            parser.error("Set LLM_API_KEY in the environment, or use --offline for local contract checks.")
         llm = create_provider()
-        print_info(f"LLM Provider: {llm.name()}")
-    except Exception as e:
-        print_fail(f"Failed to create LLM provider: {e}")
-        sys.exit(1)
-
-    # Test LLM connection
-    print_info("Testing LLM connection...")
-    try:
-        test_response = llm.complete("Say 'ready' if you can hear me.", "You are a test assistant.")
-        if test_response:
-            print_success("LLM connected successfully")
-        else:
-            print_fail("LLM returned empty response")
-            sys.exit(1)
-    except Exception as e:
-        print_fail(f"LLM connection failed: {e}")
-        print_info("Check your API key and internet connection")
-        sys.exit(1)
-
-    # Run the judge
     judge = JudgeSimulator(llm)
-    success = judge.run(TEST_SCENARIO)
-
+    # Start each invocation with an isolated test state and wipe it afterwards.
+    data, err, _ = judge.client._request("POST", "/v1/teardown")
+    if err:
+        print_fail(f"Cannot initialize test: {err}")
+        sys.exit(1)
+    try:
+        success = judge.run(args.scenario)
+    finally:
+        judge.client._request("POST", "/v1/teardown")
     sys.exit(0 if success else 1)
 
 

@@ -1,269 +1,198 @@
-"""Reply handling: deterministic classification + conversation state machine."""
+"""Recipient-bound state machine. Prepare actions; never claim external execution."""
 import re
 import time
-from typing import Optional
+from datetime import timedelta
+
+from fastapi import HTTPException
 
 from . import composer
-from .stores import (
-    ACTION_PENDING, ENDED, ENGAGED, INITIATED, WAITING, WAITING_FOR_REPLY,
-    Conversation, ConversationStore, OutreachState,
-)
+from .guardrails import validate_text
+from .routing import consent_allows, get_policy, trigger_ids
+from .stores import ACTION_PENDING, ENDED, ENGAGED, WAITING, WAITING_FOR_REPLY
+from .timeutils import parse_time
 
-# ---------------------------------------------------------------- patterns --
-
-OPT_OUT_RE = re.compile(
-    r"\b(stop|stop messaging|unsubscribe|not interested|no more|do not message|"
-    r"dont message|don't message|band karo|band kijiye|spam|useless|harassment|"
-    r"bothering me|ghatia)\b", re.I)
-HOSTILE_RE = re.compile(r"\b(idiot|stupid|nonsense|bakwas|bkwass|fool)\b", re.I)
-
-AUTO_REPLY_RES = [
-    re.compile(r"thank you for contacting", re.I),
-    re.compile(r"team will (respond|reply|get back)", re.I),
-    re.compile(r"(we|our team) will (get back|respond|reply)", re.I),
-    re.compile(r"office hours", re.I),
-    re.compile(r"automated (assistant|reply|message)", re.I),
-    re.compile(r"whatsapp business", re.I),
-    re.compile(r"away from (my|our) (desk|phone)", re.I),
-    re.compile(r"currently (unavailable|busy|out of office)", re.I),
-]
-
-INTENT_RE = re.compile(
-    r"\b(yes|yeah|yep|haan|ha\.|ok|okay|sure|go ahead|lets do it|let's do it|"
-    r"send it|send me|please send|i want to join|join karna hai|kar do|kar dijiye|"
-    r"book|confirm|proceed| sounds good|do it|please do|count me in|reserve)\b", re.I)
-
-REJECT_RE = re.compile(r"\b(no thanks|not now|maybe later|no need)\b", re.I)
-
+OPT_OUT_RE = re.compile(r"\b(stop(?: messaging| sending)?|unsubscribe|not interested|do not (?:message|contact)|don't (?:message|contact)|dont (?:message|contact)|band karo|band kijiye|spam|useless|bothering me|idiot|bakwas)\b|बंद करो", re.I)
+AUTO_REPLY_RE = re.compile(r"thank(?:s| you) for contacting|(?:our team|we|team) will (?:respond|reply|get back)|automated (?:assistant|reply|message)|away from (?:my|our) (?:desk|phone)|currently unavailable|team tak pahunch", re.I)
+DEFER_RE = re.compile(r"\b(not now|maybe later|later|busy|give me (?:some )?time|tomorrow|baad mein|kal)\b", re.I)
+NEGATION_RE = re.compile(r"\b(no|nope|nah|don't|dont|do not|not yet|cancel|nahi)\b|नहीं", re.I)
+INTENT_RE = re.compile(r"\b(go ahead|let'?s do it|send it|send me|please send|i want to join|join karna hai|kar do|kar dijiye|proceed|do it|please do|count me in|book me|reserve me)\b", re.I)
+ACCEPT_RE = re.compile(r"^\s*(yes|yeah|yep|haan|han|ha|okay|ok|sure|confirm|go|हां|हाँ)(?:\s|[,.!]|$)", re.I)
+OFF_TOPIC_RE = re.compile(r"\b(gst|income tax|itr|loan|insurance|visa|passport)\b", re.I)
 QUESTION_RE = re.compile(r"\?|\b(what|when|how|why|can you|kya|kab|kaise|kitna)\b", re.I)
 
-OFF_TOPIC_RE = re.compile(r"\b(gst|income tax|itr|loan|insurance|visa|passport)\b", re.I)
+
+def normalize(message):
+    return re.sub(r"[\W_]+", "", message.casefold())
 
 
-def normalize(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", text.lower())
-
-
-def classify(message: str) -> str:
-    """Return one of: opt_out, auto_reply, intent, rejection, question, text."""
-    if OPT_OUT_RE.search(message) or HOSTILE_RE.search(message):
+def classify(message):
+    if OPT_OUT_RE.search(message):
         return "opt_out"
-    if any(r.search(message) for r in AUTO_REPLY_RES):
+    if AUTO_REPLY_RE.search(message):
         return "auto_reply"
+    if DEFER_RE.search(message) and not INTENT_RE.search(message):
+        return "defer"
+    if NEGATION_RE.search(message):
+        return "rejection"
+    if OFF_TOPIC_RE.search(message):
+        return "off_topic"
     if INTENT_RE.search(message):
         return "intent"
-    if REJECT_RE.search(message):
-        return "rejection"
     if QUESTION_RE.search(message):
+        # "OK, let's do it. What's next?" is handled by explicit intent above.
         return "question"
+    if ACCEPT_RE.search(message):
+        return "intent"
     return "text"
 
 
-# ---------------------------------------------------------------- policies --
-
-def _is_auto_reply(message: str, conv: Conversation, state: OutreachState) -> bool:
-    if any(r.search(message) for r in AUTO_REPLY_RES):
-        return True
-    fp = normalize(message)
-    if fp and conv.fingerprint_counts.get(fp, 0) >= 2:
-        return True  # same text 3+ times = auto-reply
-    return False
-
-
 class ReplyEngine:
-    def __init__(self, contexts, convs: ConversationStore, outreach: OutreachState):
-        self.contexts = contexts
-        self.convs = convs
-        self.outreach = outreach
+    def __init__(self, contexts, convs, outreach):
+        self.contexts, self.convs, self.outreach = contexts, convs, outreach
 
-    def _send(self, conv, body, cta, rationale):
-        """Anti-repetition guard: never send the same body twice in one conversation."""
-        if body in conv.sent_bodies:
-            return {"action": "wait", "wait_seconds": 3600,
-                    "rationale": ("Composed follow-up would repeat a prior message; "
-                                  "backing off instead of repeating.")}
+    def _wait(self, conv, now, seconds, reason):
+        conv.state = WAITING
+        self.outreach.cooldowns[(conv.merchant_id, conv.customer_id)] = now + timedelta(seconds=seconds)
+        return {"action": "wait", "wait_seconds": seconds, "rationale": reason}
+
+    def _send(self, conv, body, cta, rationale, category, snapshot):
+        errors = validate_text(body, cta, category, conv.sent_bodies)
+        if errors:
+            return self._wait(conv, conv.clock, 3600, "Follow-up withheld: " + ", ".join(errors))
         conv.sent_bodies.append(body)
-        return {"action": "send", "body": body, "cta": cta, "rationale": rationale}
+        conv.turns.append({"from": "merchant_on_behalf" if conv.customer_id else "vera", "body": body, "ts": conv.clock.isoformat()})
+        self.outreach.audit.append({"conversation_id": conv.conversation_id, "trigger_id": conv.trigger_id,
+                                   "prompt_version": composer.VERSION, "model": "deterministic",
+                                   "suppression_key": snapshot[2].payload.get("suppression_key", ""),
+                                   "validator_result": "passed", "body": body,
+                                   "contexts": [{"scope": r.scope, "id": r.context_id, "version": r.version, "hash": r.hash, "stored_at": r.stored_at} for r in snapshot if r]})
+        result = {"action": "send", "body": body, "cta": cta, "rationale": rationale}
+        recipient = (conv.merchant_id, conv.customer_id)
+        inbound = self.outreach.last_inbound.get(recipient)
+        if not inbound or conv.clock - inbound >= timedelta(hours=24):
+            result.update(template_name=get_policy(snapshot[2].payload["kind"]).template_name,
+                          template_params=[body])
+        self.outreach.last_outbound[recipient] = conv.clock
+        return result
 
-    # ------------------------------------------------------------- helpers --
+    def handle(self, req):
+        started = time.monotonic()
+        audit_count = len(self.outreach.audit)
+        result = self._handle(req)
+        if result.get("action") == "send" and len(self.outreach.audit) > audit_count:
+            self.outreach.audit[-1]["latency_ms"] = (time.monotonic() - started) * 1000
+        return result
 
-    def _merchant(self, merchant_id):
-        rec = self.contexts.get("merchant", merchant_id or "")
-        return rec.payload if rec else {}
-
-    def _category(self, merchant):
-        slug = (merchant or {}).get("category_slug", "")
-        rec = self.contexts.get("category", slug)
-        return rec.payload if rec else {}
-
-    def _customer(self, customer_id):
-        if not customer_id:
-            return {}
-        rec = self.contexts.get("customer", customer_id)
-        return rec.payload if rec else {}
-
-    # --------------------------------------------------------------- entry --
-
-    def handle(self, req) -> dict:
+    def _handle(self, req):
         conv = self.convs.get(req.conversation_id)
         if conv is None:
-            conv = self._open_orphan_conversation(req)
-        conv.turns.append({
-            "from": req.from_role, "body": req.message,
-            "ts": req.received_at or "", "turn": req.turn_number,
-        })
-        conv.updated_at = time.time()
+            raise HTTPException(404, detail="unknown_conversation")
+        if ((req.merchant_id is not None and req.merchant_id != conv.merchant_id)
+                or (req.customer_id is not None and req.customer_id != conv.customer_id)
+                or req.from_role != conv.scope):
+            raise HTTPException(400, detail="conversation_recipient_mismatch")
+        recipient = (conv.merchant_id, conv.customer_id)
+        if conv.state == ENDED or recipient in self.outreach.suppressed_recipients:
+            return {"action": "end", "rationale": "Conversation ended or recipient opted out; no further outreach."}
+        # Retries with a stable turn/timestamp are idempotent. A changed body on
+        # the same numbered turn is invalid rather than a second side effect.
+        cache_key = (req.turn_number,) if req.turn_number else ((req.received_at, req.message) if req.received_at else None)
+        if cache_key in conv.reply_cache:
+            old_message, response = conv.reply_cache[cache_key]
+            if old_message != req.message:
+                raise HTTPException(409, detail="conflicting_reply_turn")
+            return response.copy()
+        now = parse_time(req.received_at) if req.received_at else conv.clock
+        if now < conv.clock or (req.turn_number and any(t.get("turn", 0) >= req.turn_number for t in conv.turns)):
+            return {"action": "wait", "wait_seconds": 1, "rationale": "Stale reply ignored."}
+        conv.clock, conv.updated_at = now, time.time()
+        conv.turns.append({"from": req.from_role, "body": req.message, "ts": now.isoformat(), "turn": req.turn_number})
+        result = self._respond(conv, req.message, now)
+        if cache_key is not None:
+            conv.reply_cache[cache_key] = (req.message, result.copy())
+        return result
 
-        message = req.message or ""
-
-        # 1) Opt-out / hostile: end and suppress.
-        if classify(message) == "opt_out":
+    def _respond(self, conv, message, now):
+        recipient = (conv.merchant_id, conv.customer_id)
+        kind = classify(message)
+        if kind == "opt_out":
+            conv.state, conv.suppressed = ENDED, True
+            self.outreach.suppressed_recipients[recipient] = "opt_out"
+            return {"action": "end", "rationale": "Recipient opted out; closing and suppressing this recipient's outreach."}
+        fp = normalize(message)
+        conv.fingerprint_counts[fp] = conv.fingerprint_counts.get(fp, 0) + 1
+        repeated = len(fp) > 10 and conv.fingerprint_counts[fp] >= 3 and kind not in {"intent", "question"}
+        if kind == "auto_reply" or repeated:
+            conv.auto_reply_count += 1
+            if conv.auto_reply_count >= 3:
+                conv.state = ENDED
+                self.outreach.cooldowns[recipient] = now + timedelta(hours=24)
+                return {"action": "end", "rationale": "Repeated automated replies; closed without more nudges."}
+            if conv.auto_reply_count >= 2 or conv.customer_id:
+                return self._wait(conv, now, 86400, "Automated reply; waiting for a human response.")
+        else:
+            conv.auto_reply_count = 0
+            self.outreach.last_inbound[recipient] = now
+            self.outreach.unanswered[recipient] = 0
+            self.outreach.cooldowns.pop(recipient, None)
+        if kind == "defer":
+            return self._wait(conv, now, 86400, "Recipient asked for time; outreach paused for a day.")
+        if kind == "rejection":
             conv.state = ENDED
-            conv.suppressed = True
-            self.outreach.suppressed_merchants[req.merchant_id or conv.merchant_id] = "opt_out"
-            return {"action": "end", "rationale":
-                    "Merchant opted out / hostile; ending conversation and suppressing future outreach."}
-
-        # 2) Auto-reply detection with graduated backoff.
-        if _is_auto_reply(message, conv, self.outreach):
-            key = (req.merchant_id or conv.merchant_id, normalize(message))
-            self.outreach.auto_reply_counts[key] = self.outreach.auto_reply_counts.get(key, 0) + 1
-            n = self.outreach.auto_reply_counts[key]
-            conv.fingerprint_counts[normalize(message)] = conv.fingerprint_counts.get(normalize(message), 0) + 1
-            if n == 1:
-                conv.state = WAITING_FOR_REPLY
-                return self._send(
-                    conv,
-                    "Looks like an auto-reply — when the owner sees this, just reply "
-                    "'Yes' and I'll pick it up from there.",
-                    "binary_yes_no",
-                    "Detected canned auto-reply; one owner-directed nudge before backing off.",
-                )
-            if n == 2:
-                conv.state = WAITING
-                return {"action": "wait", "wait_seconds": 86400,
-                        "rationale": "Same auto-reply twice in a row — owner not at phone; backing off 24h."}
+            return {"action": "end", "rationale": "Recipient declined the proposed action; conversation closed."}
+        merchant_rec = self.contexts.get("merchant", conv.merchant_id)
+        trigger_rec = self.contexts.get("trigger", conv.trigger_id)
+        if not merchant_rec or not trigger_rec:
+            return self._wait(conv, now, 3600, "Required context is missing.")
+        merchant, trigger = merchant_rec.payload, trigger_rec.payload
+        category_rec = self.contexts.get("category", merchant.get("category_slug"))
+        customer_rec = self.contexts.get("customer", conv.customer_id) if conv.customer_id else None
+        if not category_rec or trigger_ids(trigger) != recipient or trigger.get("scope") != conv.scope:
+            return self._wait(conv, now, 3600, "Current contexts no longer match this conversation.")
+        category = category_rec.payload
+        customer = customer_rec.payload if customer_rec else None
+        if conv.customer_id and (not customer or customer.get("merchant_id") != conv.merchant_id or not consent_allows(get_policy(trigger.get("kind")), customer, now)):
             conv.state = ENDED
-            return {"action": "end",
-                    "rationale": "Auto-reply 3x in a row with no engagement signal; closing conversation."}
-
-        # 3) Explicit intent: action mode immediately, no qualification.
-        if classify(message) == "intent":
-            conv.intent_detected = True
-            conv.state = ACTION_PENDING
-            body = self._intent_followup(conv)
-            return self._send(conv, body["body"], body["cta"], body["rationale"])
-
-        # 4) Soft rejection: one short acknowledgment then wait.
-        if classify(message) == "rejection":
-            conv.state = WAITING
-            return {"action": "wait", "wait_seconds": 604800,
-                    "rationale": "Merchant said not now; backing off a week instead of pushing."}
-
-        # 5) Curveball / off-topic question: acknowledge briefly, return to mission.
-        if OFF_TOPIC_RE.search(message):
-            body = self._curveball_reply(conv)
-            return self._send(conv, body, "open_ended",
-                              "Out-of-scope ask politely declined; redirected to the active mission.")
-
-        # 6) Genuine question or engaged text: contextual follow-up from mission.
+            return {"action": "end", "rationale": "Current customer consent or ownership no longer permits this purpose."}
+        snapshot = [category_rec, merchant_rec, trigger_rec, customer_rec]
+        current = composer.compose(category, merchant, trigger, customer, now=now)
+        if not current:
+            return self._wait(conv, now, 3600, "Event expired or current facts do not support a follow-up.")
+        if kind == "auto_reply" or repeated:
+            conv.state = WAITING_FOR_REPLY
+            self.outreach.cooldowns[recipient] = now + timedelta(hours=4)
+            return self._send(conv, "This looks like an automatic reply. When the owner is available, reply YES to continue.", "binary_yes_no", "One owner-directed nudge; later auto-replies back off.", category, snapshot)
+        if kind == "off_topic":
+            return self._send(conv, "I can help with the business update here; that request needs the appropriate specialist. " + current.fact, "none", "Acknowledged unrelated request and returned to the current event.", category, snapshot)
+        slots = composer.slot_labels(trigger.get("payload", {}), now)
+        if conv.customer_id and message.strip() in {"1", "2"}:
+            index = int(message.strip()) - 1
+            if index >= len(slots):
+                return self._wait(conv, now, 3600, "Selected slot is not in the current available options.")
+            kind = "intent"
+            current.next_step = f"Your requested time: {slots[index]}. The business still needs to confirm the booking."
+        if kind == "intent":
+            conv.intent_detected, conv.state = True, ACTION_PENDING
+            if not conv.customer_id and re.search(r"\b(?:i want to join|join karna hai)\b", message, re.I):
+                body = f'Onboarding request draft: "I would like to join magicpin with {composer._merchant_name(merchant)}." Submit this through the official merchant onboarding channel; registration has not been completed here.'
+            else:
+                body = current.next_step or "No executable action is defined for this question yet. Share the service you want the draft to describe."
+            if composer.language(merchant, customer) == "hi":
+                body = "Yeh raha agla step: " + body
+            return self._send(conv, body, "none", "Explicit intent: supplied a concrete draft or request status without claiming external execution.", category, snapshot)
         conv.state = ENGAGED
-        body = self._mission_followup(conv, message)
-        return self._send(conv, body["body"], body["cta"], body["rationale"])
-
-    # ------------------------------------------------------------ composers --
-
-    def _open_orphan_conversation(self, req) -> Conversation:
-        merchant = self._merchant(req.merchant_id)
-        # Inherit the active mission from this merchant's most recent conversation.
-        prior = None
-        for conv in self.convs._convs.values():
-            if conv.merchant_id != (req.merchant_id or ""):
-                continue
-            if req.customer_id and conv.customer_id != req.customer_id:
-                continue
-            if prior is None or conv.updated_at > prior.updated_at:
-                prior = conv
-        conv = self.convs.create(
-            conversation_id=req.conversation_id,
-            merchant_id=req.merchant_id or "",
-            customer_id=req.customer_id,
-            trigger_id=prior.trigger_id if prior else None,
-            scope="customer" if req.customer_id else "merchant",
-            route=prior.route if prior else "unknown",
-            state=WAITING_FOR_REPLY,
-        )
-        if prior:
-            conv.pending_action = dict(prior.pending_action or {})
-            conv.intent_detected = prior.intent_detected
+        if trigger.get("kind") in {"curious_ask_due", "scheduled_recurring"} and kind == "text":
+            body = f'Draft for review: "Asked about {message.strip()}? Contact {composer._merchant_name(merchant)} for details."'
+        elif re.search(r"\b(price|cost|kitna|fee|amount)\b", message, re.I):
+            if trigger.get("kind") == "renewal_due":
+                body = current.fact
+            elif conv.customer_id:
+                body = "A confirmed price for this request is not available in the supplied booking details. The business needs to confirm it."
+            else:
+                offers = composer._active_offers(merchant)
+                body = "Current listed offers: " + "; ".join(o["title"] for o in offers) + "." if offers else "No active offer price is supplied for this business."
+        elif kind == "question":
+            body = "Here are the available details: " + current.fact
         else:
-            conv.pending_action = {"merchant_name": merchant.get("identity", {}).get("name", "")}
-        return conv
-
-    def _intent_followup(self, conv) -> dict:
-        merchant = self._merchant(conv.merchant_id)
-        route = conv.route
-        name = composer._owner(merchant) if merchant else "there"
-        offers = composer._active_offers(merchant) if merchant else []
-
-        if route == "research_digest":
-            body = ("Sending the abstract now (2 pages). I've also drafted a patient-ed WhatsApp "
-                    "you can share — reply CONFIRM and I'll pre-fill it as a Google post for tomorrow 10am.")
-            cta = "binary_confirm_cancel"
-        elif route in ("recall_due", "trial_followup", "wedding_package_followup", "chronic_refill_due",
-                       "customer_lapsed_hard"):
-            body = ("Booking you in now. I'll send the confirmed slot details right here once "
-                    "it's locked. Anything specific we should note before your visit?")
-            cta = "open_ended"
-        elif route == "renewal_due":
-            body = ("Setting up your renewal now — I'll share the payment link and confirmation "
-                    "here. Your listing stays live without interruption.")
-            cta = "none"
-        elif route == "active_planning_intent" or conv.intent_detected:
-            offer_line = f" I'll anchor it on '{offers[0].get('title')}'." if offers else ""
-            body = (f"On it. Finalizing the draft for you now.{offer_line} "
-                    "You'll have it in a minute — reply CONFIRM to publish.")
-            cta = "binary_confirm_cancel"
-        else:
-            body = (f"Great, {name} — starting on it right away. I'll report back here as soon as "
-                    "the first step is done.")
-            cta = "none"
-        return {"body": body, "cta": cta,
-                "rationale": "Explicit commitment detected; switched to action mode without further qualification."}
-
-    def _curveball_reply(self, conv) -> str:
-        merchant = self._merchant(conv.merchant_id)
-        route = conv.route
-        anchors = {
-            "research_digest": "the JIDA fluoride recall piece — want me to send the abstract?",
-            "renewal_due": "your upcoming renewal — want me to set it up?",
-            "perf_dip": "this week's call dip — want the 5-point profile check?",
-            "competitor_opened": "the new listing nearby — want your profile refreshed first?",
-        }
-        anchor = anchors.get(route)
-        if not anchor:
-            pa = conv.pending_action or {}
-            topic = pa.get("topic", "what I flagged earlier")
-            anchor = f"{topic} — shall we finish that first?"
-        return ("That one's outside what I can help with directly — your CA will be faster there. "
-                f"Meanwhile, back to {anchor}")
-
-    def _mission_followup(self, conv, message) -> dict:
-        merchant = self._merchant(conv.merchant_id)
-        route = conv.route
-        name = composer._owner(merchant) if merchant else "there"
-        offers = composer._active_offers(merchant) if merchant else []
-        if conv.sent_bodies:
-            return {
-                "body": (f"Point taken, {name}. The one thing I'd do first: "
-                         + (f"refresh '{offers[0].get('title')}' on your listing." if offers
-                            else "pick the single highest-impact item on your profile and fix it this week."))
-                        + " Want me to handle it?",
-                "cta": "binary_yes_no",
-                "rationale": "Engaged reply; advanced the mission with one concrete next step.",
-            }
-        return {
-            "body": f"Thanks {name} — shall I take that as a go-ahead on {route.replace('_', ' ')}?",
-            "cta": "binary_yes_no",
-            "rationale": "Ambiguous engaged reply; confirmed direction without a long detour.",
-        }
+            return self._wait(conv, now, 1800, "No clear action requested; allowing time instead of repeating the pitch.")
+        return self._send(conv, body, "none", "Answered using current event or merchant facts.", category, snapshot)

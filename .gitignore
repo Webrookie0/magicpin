@@ -18,3 +18,10 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Local credentials and generated judge output
+.env
+.env.*
+!.env.example
+results/
+.pytest_cache/

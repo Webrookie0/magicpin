@@ -1,100 +1,68 @@
-"""Vera AI Assistant — FastAPI entrypoint.
-
-Run:  uvicorn bot:app --host 0.0.0.0 --port 8080
-"""
-import re
+"""Vera challenge API. Run with one worker: uvicorn bot:app --port 8080."""
+import asyncio
 import time
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app import composer, conversation
+from app import composer, conversation, llm
+from app.guardrails import validate
 from app.metadata import get_metadata
 from app.models import ContextPush, ReplyRequest, TickRequest
-from app.routing import consent_allows, get_policy
-from app.stores import ContextStore, ConversationStore, OutreachState
+from app.security import require_api_token
+from app.routing import trigger_ids
+from app.stores import ContextStore, ConversationStore, OutreachState, canonical_hash
+from app.timeutils import parse_time
 
-START = time.time()
-
-app = FastAPI(title="Vera AI Assistant", version="1.0.0")
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_handler(request, exc: RequestValidationError):
-    first = exc.errors()[0] if exc.errors() else {}
-    reason = "invalid_request"
-    field = ".".join(str(p) for p in first.get("loc", []) if p != "body")
-    if field == "scope":
-        reason = "invalid_scope"
-    elif field == "version":
-        reason = "invalid_version"
-    return JSONResponse(status_code=400, content={
-        "accepted": False,
-        "reason": reason,
-        "details": f"{field}: {first.get('msg', 'malformed request')}",
-    })
-
+START = time.monotonic()
+app = FastAPI(title="Vera AI Assistant", version="2.0.0")
 contexts = ContextStore()
 convs = ConversationStore()
 outreach = OutreachState()
 reply_engine = conversation.ReplyEngine(contexts, convs, outreach)
-
-MAX_ACTIONS_PER_TICK = 10
-MAX_BODY_CHARS = 900
-URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+MAX_ACTIONS_PER_TICK = 20
+tick_lock = asyncio.Lock()
 
 
-# --------------------------------------------------------------- utilities --
-
-def _parse_iso(ts: str) -> Optional[datetime]:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request, exc):
+    first = exc.errors()[0] if exc.errors() else {}
+    field = ".".join(str(p) for p in first.get("loc", []) if p != "body")
+    reason = {"scope": "invalid_scope", "version": "invalid_version"}.get(field, "invalid_request")
+    return JSONResponse(status_code=400, content={"accepted": False, "reason": reason,
+                                                  "details": f"{field}: {first.get('msg', 'malformed request')}"})
 
 
-def _guardrails(composed: composer.Composed, trigger: dict) -> composer.Composed:
-    """Post-composition validation: URLs, length, suppression-key equality."""
-    body = URL_RE.sub("", composed.body).strip()
-    if len(body) > MAX_BODY_CHARS:
-        body = body[: MAX_BODY_CHARS - 3].rstrip() + "..."
-    composed.body = body
-    composed.suppression_key = trigger.get("suppression_key", composed.suppression_key)
-    return composed
+@app.middleware("http")
+async def context_size_limit(request: Request, call_next):
+    if request.url.path == "/v1/context" and request.method == "POST":
+        # FastAPI's middleware caches the body for the downstream parser.
+        length = request.headers.get("content-length", "")
+        if (length.isdigit() and int(length) > 500 * 1024) or len(await request.body()) > 500 * 1024:
+            return JSONResponse(status_code=413, content={"accepted": False, "reason": "payload_too_large"})
+    return await call_next(request)
 
 
-def _action_from_composed(conv_id: str, composed: composer.Composed,
-                          merchant_id: str, customer_id: Optional[str],
-                          trigger_id: str) -> dict:
-    return {
-        "conversation_id": conv_id,
-        "merchant_id": merchant_id,
-        "customer_id": customer_id,
-        "send_as": composed.send_as,
-        "trigger_id": trigger_id,
-        "template_name": composed.template_name,
-        "template_params": composed.template_params,
-        "body": composed.body,
-        "cta": composed.cta,
-        "suppression_key": composed.suppression_key,
-        "rationale": composed.rationale,
-    }
+def compose(category, merchant, trigger, customer=None):
+    """Stateless submission interface. Empty body means no authorized, grounded send."""
+    result = composer.compose(category, merchant, trigger, customer)
+    if result:
+        return result.public()
+    return {"body": "", "cta": "none", "send_as": "merchant_on_behalf" if trigger.get("scope") == "customer" else "vera",
+            "suppression_key": trigger.get("suppression_key", ""),
+            "rationale": "Withheld: missing or invalid context, insufficient event facts, or consent does not cover this purpose."}
 
-
-# ---------------------------------------------------------------- endpoints --
 
 @app.get("/v1/healthz")
 async def healthz():
-    return {
-        "status": "ok",
-        "uptime_seconds": int(time.time() - START),
-        "contexts_loaded": contexts.counts(),
-    }
+    return {"status": "ok", "uptime_seconds": int(time.monotonic() - START), "contexts_loaded": contexts.counts()}
+
+
+@app.get("/")
+async def index():
+    return {"service": "Vera AI Assistant", "docs": "/docs", "health": "/v1/healthz"}
 
 
 @app.get("/v1/metadata")
@@ -102,107 +70,134 @@ async def metadata():
     return get_metadata()
 
 
-@app.post("/v1/context")
+@app.post("/v1/context", dependencies=[Depends(require_api_token)])
 async def push_context(body: ContextPush):
     record, stored = contexts.put(body.scope, body.context_id, body.version, body.payload)
     if not stored:
-        raise HTTPException(status_code=409, detail={
-            "accepted": False,
-            "reason": "stale_version",
-            "current_version": record.version,
-        })
-    return {
-        "accepted": True,
-        "ack_id": f"ack_{body.context_id}_v{body.version}",
-        "stored_at": datetime.now(timezone.utc).isoformat(),
-    }
+        return JSONResponse(status_code=409, content={"accepted": False, "reason": "stale_version", "current_version": record.version})
+    return {"accepted": True, "ack_id": f"ack_{body.context_id}_v{body.version}",
+            "stored_at": datetime.fromtimestamp(record.stored_at, timezone.utc).isoformat()}
 
 
-@app.post("/v1/tick")
+def _history_session(merchant, recipient, now):
+    if recipient[1] is not None:
+        return
+    for turn in merchant.get("conversation_history", []):
+        if turn.get("from") != "merchant":
+            continue
+        try:
+            ts = parse_time(turn.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if ts <= now and (recipient not in outreach.last_inbound or ts > outreach.last_inbound[recipient]):
+            outreach.last_inbound[recipient] = ts
+        if ts <= now and conversation.classify(turn.get("body", "")) == "opt_out":
+            outreach.suppressed_recipients[recipient] = "historical_opt_out"
+
+
+@app.post("/v1/tick", dependencies=[Depends(require_api_token)])
 async def tick(body: TickRequest):
-    now = _parse_iso(body.now) or datetime.now(timezone.utc)
-    actions = []
-    seen_merchants = set()
+    # The model call yields the event loop so health/context/replies stay live.
+    # Serialize tick commits to prevent two overlapping sends for one event.
+    deadline = time.monotonic() + 24
+    try:
+        async with asyncio.timeout(27):
+            async with tick_lock:
+                return await _tick(body, deadline)
+    except TimeoutError:
+        return {"actions": []}
 
-    for tid in body.available_triggers:
+
+async def _tick(body, deadline):
+    now = parse_time(body.now)
+    actions, seen_recipients = [], set()
+    records = [contexts.get("trigger", tid) for tid in dict.fromkeys(body.available_triggers)]
+    records = sorted((r for r in records if r), key=lambda r: (-r.payload.get("urgency", 1), r.context_id))
+    for record in records:
         if len(actions) >= MAX_ACTIONS_PER_TICK:
             break
-        trg_rec = contexts.get("trigger", tid)
-        if trg_rec is None:
+        trigger, tid = record.payload, record.context_id
+        mid, cid = trigger_ids(trigger)
+        recipient = (mid, cid)
+        if recipient in seen_recipients or recipient in outreach.suppressed_recipients:
             continue
-        trg = trg_rec.payload
-
-        # Expired triggers are dead.
-        expires = _parse_iso(trg.get("expires_at", ""))
-        if expires and now > expires:
+        if recipient in outreach.cooldowns and now < outreach.cooldowns[recipient]:
             continue
-
-        merchant_id = trg.get("merchant_id", "")
-        if not merchant_id or merchant_id in seen_merchants:
-            continue  # one action per merchant per tick
-        if merchant_id in outreach.suppressed_merchants:
+        if recipient in outreach.last_outbound and now < outreach.last_outbound[recipient]:
             continue
-
-        suppression_key = trg.get("suppression_key", "")
-        if suppression_key and suppression_key in outreach.sent_suppression_keys:
-            continue  # already messaged for this event
-
-        merchant_rec = contexts.get("merchant", merchant_id)
-        if merchant_rec is None:
+        dedup = (mid, cid, trigger.get("suppression_key") or tid)
+        if dedup in outreach.sent_suppression_keys:
             continue
-        merchant = merchant_rec.payload
-
-        category_rec = contexts.get("category", merchant.get("category_slug", ""))
-        category = category_rec.payload if category_rec else {}
-
-        customer = None
-        customer_id = trg.get("customer_id")
-        if trg.get("scope") == "customer":
-            cust_rec = contexts.get("customer", customer_id or "")
-            if cust_rec is None:
-                continue  # never invent customer context
-            customer = cust_rec.payload
-            policy = get_policy(trg.get("kind", ""))
-            if not consent_allows(policy, customer):
-                continue  # consent does not cover this outreach
-
-        composed = composer.compose(category, merchant, trg, customer)
-        if composed is None:
+        merchant_record = contexts.get("merchant", mid)
+        if not merchant_record:
             continue
-        composed = _guardrails(composed, trg)
-        if not composed.body:
+        merchant = merchant_record.payload
+        category_record = contexts.get("category", merchant.get("category_slug"))
+        customer_record = contexts.get("customer", cid) if cid else None
+        if not category_record or (trigger["scope"] == "customer" and not customer_record):
             continue
-
-        conv_id = f"conv_{merchant_id}_{trg.get('kind', 'evt')}_{abs(hash(suppression_key or tid)) % 10000}"
-        conv = convs.create(
-            conversation_id=conv_id,
-            merchant_id=merchant_id,
-            customer_id=customer_id,
-            trigger_id=tid,
-            scope=trg.get("scope", "merchant"),
-            route=trg.get("kind", "unknown"),
-        )
-        conv.sent_bodies.append(composed.body)
-        conv.pending_action = {"topic": trg.get("kind", "").replace("_", " "),
-                               "merchant_name": merchant.get("identity", {}).get("name", "")}
-        conv.state = "INITIATED"
-
-        actions.append(_action_from_composed(conv_id, composed, merchant_id, customer_id, tid))
-        seen_merchants.add(merchant_id)
-        if suppression_key:
-            outreach.sent_suppression_keys.add(suppression_key)
-
+        category = category_record.payload
+        customer = customer_record.payload if customer_record else None
+        _history_session(merchant, recipient, now)
+        if recipient in outreach.suppressed_recipients:
+            continue
+        started = time.monotonic()
+        result = composer.compose(category, merchant, trigger, customer, now=now)
+        if not result:
+            continue
+        snapshot = [r for r in (category_record, merchant_record, record, customer_record) if r]
+        result, generation_status = await llm.refine(result, category, merchant, trigger, customer,
+                                                      budget=deadline - time.monotonic())
+        # Contexts, consent and opt-out can change while awaiting the provider.
+        if any(not (latest := contexts.get(r.scope, r.context_id)) or latest.hash != r.hash or latest.version != r.version for r in snapshot):
+            continue
+        if recipient in outreach.suppressed_recipients or dedup in outreach.sent_suppression_keys:
+            continue
+        if (recipient in outreach.cooldowns and now < outreach.cooldowns[recipient]) or (recipient in outreach.last_outbound and now < outreach.last_outbound[recipient]):
+            continue
+        _history_session(merchant, recipient, now)
+        inbound = outreach.last_inbound.get(recipient)
+        if inbound and timedelta(0) <= now - inbound < timedelta(hours=24):
+            result.template_name, result.template_params = None, []
+        history = [turn.get("body") for turn in merchant.get("conversation_history", []) if turn.get("from") == "vera"] if not cid else []
+        if validate(result, category, merchant, trigger, customer, history):
+            continue
+        conv_id = "conv_" + canonical_hash([mid, cid, tid, record.version, dedup])[:32]
+        if convs.get(conv_id):
+            continue
+        conv = convs.create(conversation_id=conv_id, merchant_id=mid, customer_id=cid,
+                            trigger_id=tid, scope=trigger["scope"], route=trigger["kind"], clock=now)
+        conv.sent_bodies.append(result.body)
+        conv.turns.append({"from": result.send_as, "body": result.body, "ts": body.now})
+        conv.pending_action = {"topic": trigger["kind"], "next_step": result.next_step}
+        actions.append({"conversation_id": conv_id, "merchant_id": mid, "customer_id": cid,
+                        "trigger_id": tid, "template_name": result.template_name,
+                        "template_params": result.template_params, **result.public()})
+        seen_recipients.add(recipient)
+        outreach.sent_suppression_keys.add(dedup)
+        outreach.last_outbound[recipient] = now
+        count = outreach.unanswered.get(recipient, 0) + 1
+        outreach.unanswered[recipient] = count
+        outreach.cooldowns[recipient] = now + (timedelta(hours=24) if count >= 3 else timedelta(minutes=5))
+        if count >= 3:
+            outreach.unanswered[recipient] = 0
+        outreach.audit.append({"conversation_id": conv_id, "trigger_id": tid,
+                               "suppression_key": result.suppression_key, "prompt_version": llm.PROMPT_VERSION,
+                               "model": llm.model_name() if generation_status.startswith("groq_") else "deterministic",
+                               "generation_status": generation_status, "latency_ms": (time.monotonic() - started) * 1000,
+                               "validator_result": "passed", "body": result.body,
+                               "contexts": [{"scope": r.scope, "id": r.context_id, "version": r.version,
+                                             "hash": r.hash, "stored_at": r.stored_at} for r in snapshot]})
     return {"actions": actions}
 
 
-@app.post("/v1/reply")
+@app.post("/v1/reply", dependencies=[Depends(require_api_token)])
 async def reply(body: ReplyRequest):
     return reply_engine.handle(body)
 
 
-@app.post("/v1/teardown")
+@app.post("/v1/teardown", dependencies=[Depends(require_api_token)])
 async def teardown():
-    """Judge may call this at end of test; wipe all retained state."""
     contexts.wipe()
     convs.wipe()
     outreach.wipe()

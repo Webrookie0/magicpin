@@ -5,6 +5,9 @@ A repository interface is kept so Redis/SQLite can be substituted later.
 import hashlib
 import json
 import time
+from copy import deepcopy
+from datetime import datetime
+from threading import RLock
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -34,34 +37,42 @@ class ContextStore:
 
     def __init__(self) -> None:
         self._data: dict[tuple[str, str], ContextRecord] = {}
+        self._lock = RLock()
 
     def put(self, scope: str, context_id: str, version: int, payload: dict):
+        with self._lock:
+            return self._put(scope, context_id, version, payload)
+
+    def _put(self, scope, context_id, version, payload):
         key = (scope, context_id)
         current = self._data.get(key)
         if current is not None and version <= current.version:
-            return current, False  # stale / duplicate
+            return deepcopy(current), False  # stale / duplicate
         record = ContextRecord(
             scope=scope,
             context_id=context_id,
             version=version,
-            payload=payload,
+            payload=deepcopy(payload),
             stored_at=time.time(),
             hash=canonical_hash(payload),
         )
         self._data[key] = record
-        return record, True
+        return deepcopy(record), True
 
     def get(self, scope: str, context_id: str) -> Optional[ContextRecord]:
-        return self._data.get((scope, context_id))
+        with self._lock:
+            return deepcopy(self._data.get((scope, context_id)))
 
     def counts(self) -> dict[str, int]:
-        counts = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
-        for scope, _ in self._data:
-            counts[scope] = counts.get(scope, 0) + 1
-        return counts
+        with self._lock:
+            counts = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
+            for scope, _ in self._data:
+                counts[scope] = counts.get(scope, 0) + 1
+            return counts
 
     def wipe(self) -> None:
-        self._data.clear()
+        with self._lock:
+            self._data.clear()
 
 
 # Conversation states
@@ -91,6 +102,9 @@ class Conversation:
     pending_action: Optional[dict] = None              # mission facts for follow-ups
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    clock: Optional[datetime] = None
+    auto_reply_count: int = 0
+    reply_cache: dict = field(default_factory=dict)
 
 
 class ConversationStore:
@@ -98,6 +112,8 @@ class ConversationStore:
         self._convs: dict[str, Conversation] = {}
 
     def create(self, **kwargs) -> Conversation:
+        if kwargs["conversation_id"] in self._convs:
+            raise ValueError("conversation_id already exists")
         conv = Conversation(**kwargs)
         self._convs[conv.conversation_id] = conv
         return conv
@@ -111,7 +127,7 @@ class ConversationStore:
         for conv in self._convs.values():
             if conv.merchant_id != merchant_id or conv.state == ENDED:
                 continue
-            if customer_id is not None and conv.customer_id != customer_id:
+            if conv.customer_id != customer_id:
                 continue
             if best is None or conv.updated_at > best.updated_at:
                 best = conv
@@ -126,8 +142,12 @@ class OutreachState:
 
     def __init__(self) -> None:
         self.sent_suppression_keys: set = set()
-        self.suppressed_merchants: dict[str, str] = {}  # merchant_id -> reason
-        self.auto_reply_counts: dict[tuple, int] = {}   # (merchant_id, fingerprint) -> n
+        self.suppressed_recipients: dict[tuple, str] = {}
+        self.cooldowns: dict[tuple, datetime] = {}
+        self.last_inbound: dict[tuple, datetime] = {}
+        self.last_outbound: dict[tuple, datetime] = {}
+        self.unanswered: dict[tuple, int] = {}
+        self.audit: list[dict] = []
 
     def wipe(self) -> None:
         self.__init__()
