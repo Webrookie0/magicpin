@@ -14,7 +14,9 @@ from .timeutils import parse_time
 OPT_OUT_RE = re.compile(r"\b(stop(?: messaging| sending)?|unsubscribe|not interested|do not (?:message|contact)|don't (?:message|contact)|dont (?:message|contact)|band karo|band kijiye|spam|useless|bothering me|idiot|bakwas)\b|बंद करो", re.I)
 AUTO_REPLY_RE = re.compile(r"thank(?:s| you) for contacting|(?:our team|we|team) will (?:respond|reply|get back)|automated (?:assistant|reply|message)|away from (?:my|our) (?:desk|phone)|currently unavailable|team tak pahunch", re.I)
 DEFER_RE = re.compile(r"\b(not now|maybe later|later|busy|give me (?:some )?time|tomorrow|baad mein|kal)\b", re.I)
-NEGATION_RE = re.compile(r"\b(no|nope|nah|don't|dont|do not|not yet|cancel|nahi)\b|नहीं", re.I)
+NEGATION_RE = re.compile(r"\b(no|nope|nah|don't|dont|do not|not yet|cancel|nahi|nahin|nhi)\b|नहीं", re.I)
+# "idea/pata nahi hai" = "I don't know" -> a request for help, not a decline.
+DONT_KNOW_RE = re.compile(r"\b(?:idea|pata|malum|maalum|andaza)\s+(?:nahi|nahin|nhi|nahi hai)\b", re.I)
 INTENT_RE = re.compile(r"\b(go ahead|let'?s do it|send it|send me|please send|i want to join|join karna hai|kar do|kar dijiye|proceed|do it|please do|count me in|book me|reserve me)\b", re.I)
 ACCEPT_RE = re.compile(r"^\s*(yes|yeah|yep|haan|han|ha|okay|ok|sure|confirm|go|हां|हाँ)(?:\s|[,.!]|$)", re.I)
 OFF_TOPIC_RE = re.compile(r"\b(gst|income tax|itr|loan|insurance|visa|passport)\b", re.I)
@@ -32,7 +34,7 @@ def classify(message):
         return "auto_reply"
     if DEFER_RE.search(message) and not INTENT_RE.search(message):
         return "defer"
-    if NEGATION_RE.search(message):
+    if NEGATION_RE.search(message) and not DONT_KNOW_RE.search(message):
         return "rejection"
     if OFF_TOPIC_RE.search(message):
         return "off_topic"
