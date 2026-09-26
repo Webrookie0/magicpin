@@ -1,5 +1,6 @@
 """Vera challenge API. Run with one worker: uvicorn bot:app --port 8080."""
 import asyncio
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -7,11 +8,11 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app import composer, conversation, llm
+from app import composer, conversation, db, llm
+from app.auth import auth_caller, owner_user_id, supabase_auth_configured
 from app.guardrails import validate
 from app.metadata import get_metadata
 from app.models import ContextPush, ReplyRequest, TickRequest
-from app.security import require_api_token
 from app.routing import trigger_ids
 from app.stores import ContextStore, ConversationStore, OutreachState, canonical_hash
 from app.timeutils import parse_time
@@ -57,7 +58,11 @@ def compose(category, merchant, trigger, customer=None):
 
 @app.get("/v1/healthz")
 async def healthz():
-    return {"status": "ok", "uptime_seconds": int(time.monotonic() - START), "contexts_loaded": contexts.counts()}
+    return {"status": "ok", "uptime_seconds": int(time.monotonic() - START),
+            "contexts_loaded": contexts.counts(),
+            "database": db.health()["status"],
+            "auth": {"api_token": bool(os.environ.get("VERA_API_TOKEN", "")),
+                     "supabase": supabase_auth_configured()}}
 
 
 @app.get("/")
@@ -70,11 +75,12 @@ async def metadata():
     return get_metadata()
 
 
-@app.post("/v1/context", dependencies=[Depends(require_api_token)])
-async def push_context(body: ContextPush):
+@app.post("/v1/context")
+async def push_context(body: ContextPush, principal: dict = Depends(auth_caller)):
     record, stored = contexts.put(body.scope, body.context_id, body.version, body.payload)
     if not stored:
         return JSONResponse(status_code=409, content={"accepted": False, "reason": "stale_version", "current_version": record.version})
+    db.save_context(body.scope, body.context_id, body.version, body.payload, owner_user_id(principal))
     return {"accepted": True, "ack_id": f"ack_{body.context_id}_v{body.version}",
             "stored_at": datetime.fromtimestamp(record.stored_at, timezone.utc).isoformat()}
 
@@ -95,20 +101,20 @@ def _history_session(merchant, recipient, now):
             outreach.suppressed_recipients[recipient] = "historical_opt_out"
 
 
-@app.post("/v1/tick", dependencies=[Depends(require_api_token)])
-async def tick(body: TickRequest):
+@app.post("/v1/tick")
+async def tick(body: TickRequest, principal: dict = Depends(auth_caller)):
     # The model call yields the event loop so health/context/replies stay live.
     # Serialize tick commits to prevent two overlapping sends for one event.
     deadline = time.monotonic() + 24
     try:
         async with asyncio.timeout(27):
             async with tick_lock:
-                return await _tick(body, deadline)
+                return await _tick(body, deadline, owner_user_id(principal))
     except TimeoutError:
         return {"actions": []}
 
 
-async def _tick(body, deadline):
+async def _tick(body, deadline, owner=None):
     now = parse_time(body.now)
     actions, seen_recipients = [], set()
     records = [contexts.get("trigger", tid) for tid in dict.fromkeys(body.available_triggers)]
@@ -170,9 +176,12 @@ async def _tick(body, deadline):
         conv.sent_bodies.append(result.body)
         conv.turns.append({"from": result.send_as, "body": result.body, "ts": body.now})
         conv.pending_action = {"topic": trigger["kind"], "next_step": result.next_step}
-        actions.append({"conversation_id": conv_id, "merchant_id": mid, "customer_id": cid,
-                        "trigger_id": tid, "template_name": result.template_name,
-                        "template_params": result.template_params, **result.public()})
+        action = {"conversation_id": conv_id, "merchant_id": mid, "customer_id": cid,
+                  "trigger_id": tid, "template_name": result.template_name,
+                  "template_params": result.template_params, **result.public()}
+        actions.append(action)
+        db.save_conversation(conv_id, mid, cid, trigger["kind"], conv.state, owner)
+        db.save_message(conv_id, result.send_as, result.body, action)
         seen_recipients.add(recipient)
         outreach.sent_suppression_keys.add(dedup)
         outreach.last_outbound[recipient] = now
@@ -191,14 +200,41 @@ async def _tick(body, deadline):
     return {"actions": actions}
 
 
-@app.post("/v1/reply", dependencies=[Depends(require_api_token)])
-async def reply(body: ReplyRequest):
-    return reply_engine.handle(body)
+@app.post("/v1/reply")
+async def reply(body: ReplyRequest, principal: dict = Depends(auth_caller)):
+    response = reply_engine.handle(body)
+    db.save_message(body.conversation_id, body.from_role, body.message, None)
+    if response.get("action") == "send" and response.get("body"):
+        db.save_message(body.conversation_id, "vera", response["body"], response)
+    return response
 
 
-@app.post("/v1/teardown", dependencies=[Depends(require_api_token)])
-async def teardown():
+@app.post("/v1/teardown")
+async def teardown(principal: dict = Depends(auth_caller)):
     contexts.wipe()
     convs.wipe()
     outreach.wipe()
     return {"wiped": True}
+
+
+@app.get("/v1/whoami")
+async def whoami(principal: dict = Depends(auth_caller)):
+    return {
+        "auth_kind": principal["kind"],
+        "user_id": principal.get("user_id"),
+        "email": principal.get("email"),
+        "supabase_auth_configured": supabase_auth_configured(),
+        "database": db.health(),
+    }
+
+
+@app.get("/v1/conversations")
+async def list_conversations_endpoint(principal: dict = Depends(auth_caller), limit: int = 50):
+    rows = db.list_conversations(min(max(limit, 1), 200))
+    return {"database": db.health()["status"], "conversations": rows or []}
+
+
+@app.get("/v1/conversations/{conversation_id}/messages")
+async def conversation_messages_endpoint(conversation_id: str, principal: dict = Depends(auth_caller)):
+    rows = db.conversation_messages(conversation_id)
+    return {"database": db.health()["status"], "conversation_id": conversation_id, "messages": rows or []}

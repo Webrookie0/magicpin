@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: vera-merchant-assistant
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    healthCheckPath: /v1/healthz
+    autoDeploy: false
+    envVars:
+      - key: VERA_API_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        value: https://supabase-api-prod.verdent.ai/p/p2ca0dd42956a4535ddd9
+      - key: SUPABASE_ANON_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoyMTA2MDM0MTA0LCJpYXQiOjE3OTA0MTQ5MDQsImlzcyI6InN1cGFiYXNlIiwicHJvamVjdF9yZWYiOiJwMmNhMGRkNDI5NTZhNDUzNWRkZDkiLCJyb2xlIjoiYW5vbiJ9.bUmf1kR9B3y9eQgMk94ZBlXNEvoU6LBLr5-bqQkadY0

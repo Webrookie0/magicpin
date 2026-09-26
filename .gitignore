@@ -25,3 +25,6 @@ env/
 !.env.example
 results/
 .pytest_cache/
+
+# Verdent workspace state
+.verdent/
